@@ -3,9 +3,18 @@ Modal.com deployment for the LegalQA pipeline.
 
 Data layout on the Modal Volume ("legalqa-data"), mounted at /data:
     /data/TASK2/TASK2/...              <- unzip TASK2.zip here
+<<<<<<< HEAD
     /data/stopwords.txt
     /data/bm25_index_stopword.pkl      <- optional, built if missing
     /data/outputs/...                  <- all pipeline outputs land here
+=======
+    /data/bm25_index_stopword.pkl      <- optional, built if missing
+    /data/outputs/...                  <- all pipeline outputs land here
+
+Note: Vietnamese stopwords are baked into the package itself
+(legalqa/stopwords_data.py) -- no stopwords.txt needs to be uploaded.
+`--stopwords-file` below is kept only as an optional override.
+>>>>>>> 2c3816f (fixed bug)
     /data/outputs/cache/dense_chunk_index_base.pkl
     /data/outputs/cache/dense_chunk_index_finetuned.pkl
     /data/outputs/finetuned_bi_encoder/
@@ -93,7 +102,11 @@ def finetune(
     task2_data_dir: str = "/data/TASK2/TASK2",
     output_dir: str = "/data/outputs",
     dense_cache_file: str = "/data/outputs/cache/dense_chunk_index_base.pkl",
+<<<<<<< HEAD
     stopwords_file: str = "/data/stopwords.txt",
+=======
+    stopwords_file: str = None,  # no longer needed -- stopwords are baked into the package
+>>>>>>> 2c3816f (fixed bug)
     bm25_cache_file: str = "/data/bm25_index_stopword.pkl",
 ):
     """Stage 1: mine hard negatives + fine-tune bi-encoder & cross-encoder."""
@@ -154,7 +167,11 @@ def run_pipeline(
     dense_cache_file: str = "/data/outputs/cache/dense_chunk_index_finetuned.pkl",
     bi_encoder_name: str = "/data/outputs/finetuned_bi_encoder",
     cross_encoder_name: str = "/data/outputs/finetuned_cross_encoder",
+<<<<<<< HEAD
     stopwords_file: str = "/data/stopwords.txt",
+=======
+    stopwords_file: str = None,  # no longer needed -- stopwords are baked into the package
+>>>>>>> 2c3816f (fixed bug)
     bm25_cache_file: str = "/data/bm25_index_stopword.pkl",
     val_size: int = 1000,
     run_tag: str = "final",

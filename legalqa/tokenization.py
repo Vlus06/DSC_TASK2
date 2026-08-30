@@ -3,6 +3,11 @@ from __future__ import annotations
 import os
 from typing import Iterable, List, Optional, Set
 
+<<<<<<< HEAD
+=======
+from .stopwords_data import DEFAULT_STOPWORDS
+
+>>>>>>> 2c3816f (fixed bug)
 
 class VietnameseTokenizer:
     """Thin wrapper around `underthesea.word_tokenize` with stopword filtering.
@@ -10,6 +15,7 @@ class VietnameseTokenizer:
     Centralizes the `vi_tokenize_clean` / `token_overlap_score` /
     `lexical_overlap_score` helpers that were duplicated across the
     original mining and QA-pipeline notebooks.
+<<<<<<< HEAD
     """
 
     def __init__(self, stopwords_file: Optional[str] = None):
@@ -18,6 +24,22 @@ class VietnameseTokenizer:
             with open(stopwords_file, "r", encoding="utf-8") as f:
                 raw = f.read().splitlines()
             self.stopwords = {w.replace(" ", "_") for w in raw}
+=======
+
+    Stopwords are baked into the package (`legalqa/stopwords_data.py`) so no
+    external `stopwords.txt` needs to be uploaded/mounted at runtime. Pass
+    `stopwords_file` only if you want to override the built-in list with a
+    different file.
+    """
+
+    def __init__(self, stopwords_file: Optional[str] = None):
+        if stopwords_file and os.path.exists(stopwords_file):
+            with open(stopwords_file, "r", encoding="utf-8") as f:
+                raw = f.read().splitlines()
+            self.stopwords: Set[str] = {w.replace(" ", "_") for w in raw if w.strip()}
+        else:
+            self.stopwords = {w.replace(" ", "_") for w in DEFAULT_STOPWORDS}
+>>>>>>> 2c3816f (fixed bug)
 
     def tokenize_clean(self, text: str, max_chars: Optional[int] = None) -> List[str]:
         if max_chars:
