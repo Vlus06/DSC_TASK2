@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import pickle
 import re
 from collections import defaultdict
@@ -11,13 +12,21 @@ from tqdm.auto import tqdm
 
 from ..config import ChunkCacheConfig
 from ..corpus import Corpus
-from ..legal_metadata import LegalMetadataExtractor
 from ..utils import free_memory, get_device, logger
 
-_DIEU_SPLIT_RE = re.compile(r"(?=Điều\s+\d+[a-zA-Z]?\s*(?:\([^)]*\))?\s*[\.:])")
+# =============================================================================
+# Chunk-prefix splitting + answer-time boilerplate stripping.
+#
+# These two are used AFTER retrieval, when assembling the final answer text
+# (see legalqa/answer/answer_builder.py) -- they strip letterhead lines from
+# the chunk BODY that gets shown to the user. This is a different mechanism
+# from `BOILERPLATE_TITLE_PATTERN` below, which discards whole CHUNKS at
+# cache-build time (e.g. a "Pham vi dieu chinh" Dieu is rarely useful as a
+# standalone retrieval hit). Both existed independently in the original
+# notebooks and are kept independently here.
+# =============================================================================
 _CHUNK_PREFIX_SPLIT_RE = re.compile(r"^(.{0,200}?\.)\n(.*)$", re.DOTALL)
 
-# Same boilerplate-line filters used everywhere else in the pipeline.
 _BOILERPLATE_LINE_PATTERNS = [
     re.compile(r"^\s*CỘNG\s*HÒA\s*XÃ\s*HỘI\s*CHỦ\s*NGHĨA\s*VIỆT\s*NAM\s*$", re.IGNORECASE),
     re.compile(r"^\s*Độc\s*lập\s*[-–]\s*Tự\s*do\s*[-–]\s*Hạnh\s*phúc\s*$", re.IGNORECASE),
@@ -27,12 +36,6 @@ _BOILERPLATE_LINE_PATTERNS = [
     re.compile(r"^\s*(?:BỘ|CHÍNH\s+PHỦ|QUỐC\s+HỘI)[^\n]{0,60}$"),
     re.compile(r"^\s*Số\s*[:\.]?\s*[\dA-Za-zĐđ/\-]+\s*$"),
 ]
-
-# Fixes lines that got broken mid-word / mid-sentence by the source PDF/HTML
-# extraction (a single trailing hyphen or a lowercase-continuation newline).
-_LINE_JOIN_HYPHEN_RE = re.compile(r"-\n(?=[a-zàáâãèéêìíòóôõùúăđĩũơư])")
-_LINE_JOIN_LOWER_CONTINUATION_RE = re.compile(r"\n(?=[a-zàáâãèéêìíòóôõùúăđĩũơư])")
-_LIST_MARKER_FIX_RE = re.compile(r"\n(?=[a-zđ]\)\s)")
 
 
 def strip_boilerplate_lines(text: str) -> str:
@@ -51,22 +54,138 @@ def strip_boilerplate_lines(text: str) -> str:
     return cleaned.strip()
 
 
-def fix_broken_lines(text: str) -> str:
-    """Rejoin lines that were broken mid-word/mid-sentence by extraction."""
-    text = _LINE_JOIN_HYPHEN_RE.sub("", text)
-    text = _LINE_JOIN_LOWER_CONTINUATION_RE.sub(" ", text)
-    return text
-
-
-def split_chunk_prefix_and_body(
-    chunk_text: str, has_prefix: bool = True
-) -> Tuple[str, str]:
+def split_chunk_prefix_and_body(chunk_text: str, has_prefix: bool = True) -> Tuple[str, str]:
     if not has_prefix:
         return "", chunk_text
     m = _CHUNK_PREFIX_SPLIT_RE.match(chunk_text)
     if m:
         return m.group(1).strip(), m.group(2).strip()
     return "", chunk_text
+
+
+# =============================================================================
+# join_broken_lines -- v4.1, WITH the list-marker fix.
+#
+# Joins single \n that got inserted mid-word/mid-sentence by the source
+# extraction, WITHOUT touching real paragraph breaks (\n\n) and WITHOUT
+# joining two consecutive list items ("a) ...\nb) ..."), which the v4 (no
+# suffix) regex used to join incorrectly.
+# =============================================================================
+_VN_LOWER = "a-zàáảãạăằắẳẵặâầấẩẫậđèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵ"
+_TRAILING_SPACE_BEFORE_NL = re.compile(r"[ \t]+\n")
+_PARA_BREAK_PLACEHOLDER = "\uE000"
+_SINGLE_NL_MIDWORD = re.compile(
+    r"(?<=[^\.\:\;\)\-\uE000])\n"
+    r"(?=[" + _VN_LOWER + r"])"
+    r"(?!\s*[a-zđ]\)\s)"
+)
+
+
+def join_broken_lines(text: str) -> str:
+    """Rejoin lines broken mid-word/mid-sentence by extraction, preserving
+    real paragraph breaks (\\n\\n) and consecutive letter-list items
+    ("a) ...\\nb) ...")."""
+    if not text:
+        return text
+    text = _TRAILING_SPACE_BEFORE_NL.sub("\n", text)
+    text = text.replace("\n\n", _PARA_BREAK_PLACEHOLDER)
+    text = _SINGLE_NL_MIDWORD.sub(" ", text)
+    text = text.replace(_PARA_BREAK_PLACEHOLDER, "\n\n")
+    return text
+
+
+_SANITY_EXAMPLES_SHOULD_JOIN = [
+    "hoạt động quản lý, điều \nhành của tổ chức đại diện",
+    "Trình tự cấp \nlại, điều chỉnh Giấy chứng nhận đủ điều kiện kinh doanh dược",
+    "Cơ cấu tổ \nchức",
+]
+_SANITY_EXAMPLES_SHOULD_NOT_JOIN = [
+    "a) Nội dung thứ nhất\nb) Nội dung thứ hai",
+    "cấp phép cho tổ chức\nb) Điều kiện khác",
+]
+
+
+def sanity_check_join_broken_lines() -> bool:
+    """Run before building a full-corpus cache to catch a regressed
+    _SINGLE_NL_MIDWORD regex early (cheap; matches the notebook's checks)."""
+    ok = True
+    for ex in _SANITY_EXAMPLES_SHOULD_JOIN:
+        result = "\n" not in join_broken_lines(ex)
+        if not result:
+            logger.warning(f"[sanity] SHOULD have joined but didn't: {ex!r}")
+        ok = ok and result
+    for ex in _SANITY_EXAMPLES_SHOULD_NOT_JOIN:
+        result = "\n" in join_broken_lines(ex)
+        if not result:
+            logger.warning(f"[sanity] SHOULD NOT have joined but did: {ex!r}")
+        ok = ok and result
+    logger.info(f"Sanity check join_broken_lines: {'OK' if ok else 'FAIL -- check _SINGLE_NL_MIDWORD regex!'}")
+    return ok
+
+
+# =============================================================================
+# Chunk-by-Dieu/Khoan (v4.1) -- Dieu split, falling back to paragraph split,
+# falling back to Khoan split; oversized pieces are further split by Khoan
+# with a sliding window; whole "Pham vi dieu chinh"/"Doi tuong ap dung"
+# Dieu are dropped; each surviving chunk is prefixed with "<doc name>.
+# <Dieu title>." for self-containedness.
+# =============================================================================
+DIEU_PATTERN = re.compile(r"(?=Điều\s+\d+[a-zA-Z]?\s*(?:\([^)]*\))?\s*[\.:])")
+DIEU_TITLE_PATTERN = re.compile(r"^\s*(Điều\s+\d+[a-zA-Z]?\s*(?:\([^)]*\))?\s*[\.:]\s*[^\n]{0,120})")
+KHOAN_PATTERN = re.compile(r"(?=(?:^|\n)\s*\d+[\.\)]\s)")
+
+BOILERPLATE_TITLE_PATTERN = re.compile(
+    r"^\s*Điều\s+\d+[a-zA-Z]?\s*[\.:]\s*"
+    r"(Phạm\s+vi\s+điều\s+chỉnh|Đối\s+tượng\s+áp\s+dụng)",
+    re.IGNORECASE,
+)
+
+
+def clean_text(text: str, enable_line_join_fix: bool = True) -> str:
+    if not text:
+        return ""
+    text = text.replace("\r\n", " ").replace("\r", " ")
+    text = re.sub(r"[ \t\x0b\x0c]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = text.strip()
+    if enable_line_join_fix:
+        text = join_broken_lines(text)
+    return text
+
+
+def _split_by_khoan(text: str, max_chars: int) -> List[str]:
+    parts = [p for p in KHOAN_PATTERN.split(text) if p.strip()]
+    if len(parts) <= 1:
+        parts = [text]
+    final_parts = []
+    step = max(max_chars - 200, 1)
+    for p in parts:
+        if len(p) <= max_chars:
+            final_parts.append(p)
+        else:
+            for i in range(0, len(p), step):
+                final_parts.append(p[i : i + max_chars])
+    return final_parts
+
+
+def _extract_dieu_title(dieu_part: str) -> str:
+    m = DIEU_TITLE_PATTERN.match(dieu_part)
+    if m:
+        return re.sub(r"\s+", " ", m.group(1)).strip()
+    return ""
+
+
+def resolve_doc_name(name: str, link: str) -> str:
+    """Doc-name resolution used for the chunk prefix: prefer the `name`
+    field from the context JSON; otherwise derive a readable slug from
+    `link` (strip trailing `-<id>.aspx`, replace hyphens with spaces)."""
+    if name:
+        return name
+    if not link:
+        return ""
+    slug = link.rstrip("/").split("/")[-1]
+    slug = re.sub(r"-\d+\.aspx$", "", slug)
+    return slug.replace("-", " ")
 
 
 @dataclass
@@ -117,89 +236,118 @@ class DenseChunkCache:
 
 
 class DenseChunkCacheBuilder:
-    """Builds a `DenseChunkCache` from a `Corpus` + bi-encoder.
+    """Builds a `DenseChunkCache` from a `Corpus` + bi-encoder, following
+    the authoritative v4.1 `build_dense_cache` logic 1:1:
 
-    Chunking strategy (mirrors the `chunk_logic_version` recorded in the
-    original notebooks' cache meta,
-    ``v4_1_docname_dieutitle_boilerplatefilter_keepgiaithich_linejoinfix_listmarkerfix``):
+      1. clean_text() -> join_broken_lines() (v4.1, list-marker-safe).
+      2. Split on `Điều N` boundaries; if the document has no `Điều`
+         markers, fall back to paragraph split (`\\n\\n`); if that also
+         fails, fall back to Khoan split.
+      3. Drop whole chunks matching BOILERPLATE_TITLE_PATTERN ("Phạm vi
+         điều chỉnh" / "Đối tượng áp dụng" Điều).
+      4. If a piece still exceeds `chunk_max_chars`, split it further by
+         Khoan with a sliding window.
+      5. Prefix each surviving chunk with "<doc name>. <Điều title>.\\n"
+         so it's self-contained once retrieved.
 
-    1. Split each document on `Điều N` boundaries.
-    2. Fix line breaks introduced by PDF/HTML extraction.
-    3. Strip boilerplate lines (letterhead, chapter/section-only lines...)
-       while explicitly keeping "Giải thích từ ngữ" (definitions) sections.
-    4. Prefix each chunk with "<doc name>. <Điều title>." so the chunk is
-       self-contained once retrieved.
-    5. Merge/greedily pack Điều-level pieces into chunks up to
-       `chunk_max_chars` (derived from the encoder's max_seq_length via
-       `chars_per_token_init * safety_margin`), never splitting a single
-       Điều across chunks unless it alone exceeds the budget.
+    Note: unlike a naive "pack chunks up to chunk_max_chars" strategy, this
+    does NOT merge multiple Điều into a single chunk -- each Điều (or
+    Khoan-split piece of an oversized Điều) becomes exactly one chunk.
     """
 
-    def __init__(self, corpus: Corpus, config: ChunkCacheConfig, encode_max_seq_length: int = 2048):
+    def __init__(self, corpus: Corpus, config: ChunkCacheConfig):
         self.corpus = corpus
         self.config = config
-        self.chunk_max_chars = config.chunk_max_chars or int(
-            encode_max_seq_length * config.chars_per_token_init * config.safety_margin
-        )
+        self.chunk_max_chars: Optional[int] = config.chunk_max_chars  # resolved once the model's max_seq_length is known
 
-    def _chunk_document(self, doc_id: str, passage: str) -> List[str]:
+    def _resolve_chunk_max_chars(self, bi_encoder) -> int:
         cfg = self.config
-        doc_name = self.corpus.get_name(doc_id) or ""
-        doc_title_line = LegalMetadataExtractor.extract_doc_title_line(passage) or doc_name
+        if cfg.chunk_max_chars:
+            return cfg.chunk_max_chars
+        try:
+            model_max_seq = bi_encoder.max_seq_length
+        except Exception:
+            model_max_seq = None
+        if not model_max_seq or model_max_seq > 8192:
+            model_max_seq = 256
+            logger.warning(f"Could not read a valid max_seq_length from model -- falling back to {model_max_seq} tokens.")
+        chunk_max_chars = int(model_max_seq * cfg.chars_per_token_init * cfg.safety_margin)
+        logger.info(
+            f"max_seq_length={model_max_seq} tokens -> chunk_max_chars="
+            f"{chunk_max_chars} chars (chars_per_token_init={cfg.chars_per_token_init})."
+        )
+        return chunk_max_chars
 
-        parts = [p for p in _DIEU_SPLIT_RE.split(passage) if p.strip()]
-        if len(parts) <= 1:
-            parts = [passage]
+    def _doc_name(self, doc_id: str) -> str:
+        return resolve_doc_name(self.corpus.get_name(doc_id), self.corpus.get_link(doc_id))
 
-        pieces: List[str] = []
-        for part in parts:
-            text = part
-            if cfg.enable_line_join_fix:
-                text = fix_broken_lines(text)
-            if cfg.enable_boilerplate_filter:
-                # Explicitly keep "Giải thích từ ngữ" (definitions) sections --
-                # the filter only removes letterhead/section-marker lines, never
-                # substantive Điều content.
-                text = strip_boilerplate_lines(text)
+    def _chunk_document(self, doc_id: str, passage: str) -> List[dict]:
+        cfg = self.config
+        max_chars = self.chunk_max_chars
+        doc_name = self._doc_name(doc_id) if cfg.enable_doc_name_prefix else ""
+
+        passage = clean_text(passage, enable_line_join_fix=cfg.enable_line_join_fix)
+        if not passage:
+            return []
+
+        dieu_parts = [p for p in DIEU_PATTERN.split(passage) if p.strip()]
+        if len(dieu_parts) <= 1:
+            paras = [p for p in passage.split("\n\n") if p.strip()]
+            if len(paras) <= 1:
+                dieu_parts = _split_by_khoan(passage, max_chars)
+            else:
+                dieu_parts = paras
+
+        chunks_raw: List[Tuple[str, str]] = []
+        for part in dieu_parts:
+            part = part.strip()
+            if not part:
+                continue
+
+            dieu_title = _extract_dieu_title(part) if cfg.enable_dieu_title_prefix else ""
+
+            if cfg.enable_boilerplate_filter and BOILERPLATE_TITLE_PATTERN.match(part):
+                continue
+
+            if len(part) <= max_chars:
+                chunks_raw.append((part, dieu_title))
+            else:
+                for sub in _split_by_khoan(part, max_chars):
+                    chunks_raw.append((sub, dieu_title))
+
+        result = []
+        for i, (text, dieu_title) in enumerate(chunks_raw):
             text = text.strip()
             if not text:
                 continue
 
-            dieu_info = LegalMetadataExtractor.extract_dieu_info(text)
-            dieu_title = dieu_info.dieu_title
+            prefix_parts = []
+            if cfg.enable_doc_name_prefix and doc_name:
+                prefix_parts.append(doc_name)
+            if cfg.enable_dieu_title_prefix and dieu_title and not text.startswith(dieu_title):
+                prefix_parts.append(dieu_title)
 
-            prefix_bits = []
-            if cfg.enable_doc_name_prefix and doc_title_line:
-                prefix_bits.append(doc_title_line.rstrip("."))
-            if cfg.enable_dieu_title_prefix and dieu_title:
-                prefix_bits.append(dieu_title.rstrip("."))
-            prefix = (". ".join(prefix_bits) + ".\n") if prefix_bits else ""
-
-            body = prefix + text
-            # Greedy packing: split overly long single-Điều pieces at
-            # sentence-ish boundaries so no chunk exceeds the budget.
-            while len(body) > self.chunk_max_chars:
-                cut = body.rfind("\n", 0, self.chunk_max_chars)
-                if cut < self.chunk_max_chars * 0.5:
-                    cut = self.chunk_max_chars
-                pieces.append(body[:cut].strip())
-                body = (prefix + body[cut:].strip()) if prefix else body[cut:].strip()
-            if body.strip():
-                pieces.append(body.strip())
-        return pieces
+            final_text = (". ".join(prefix_parts) + ".\n" + text) if prefix_parts else text
+            result.append({"doc_id": doc_id, "chunk_id": f"{doc_id}_{i}", "text": final_text})
+        return result
 
     def build(self, bi_encoder, show_progress: bool = True) -> DenseChunkCache:
+        if not sanity_check_join_broken_lines():
+            logger.warning("join_broken_lines sanity check FAILED -- proceeding anyway, but inspect the regex first.")
+
+        self.chunk_max_chars = self._resolve_chunk_max_chars(bi_encoder)
+
         chunk_doc_ids_all: List[str] = []
         chunk_texts_all: List[str] = []
 
         items = self.corpus.doc_id_to_passage.items()
-        iterator = tqdm(items, total=len(self.corpus), desc="Chunking corpus") if show_progress else items
+        iterator = tqdm(items, total=len(self.corpus), desc="Chunking corpus (v4.1)") if show_progress else items
         for doc_id, passage in iterator:
             for piece in self._chunk_document(doc_id, passage):
-                chunk_doc_ids_all.append(doc_id)
-                chunk_texts_all.append(piece)
+                chunk_doc_ids_all.append(piece["doc_id"])
+                chunk_texts_all.append(piece["text"])
 
-        logger.info(f"Chunked corpus into {len(chunk_texts_all)} chunks (max_chars={self.chunk_max_chars}).")
+        logger.info(f"Chunked corpus into {len(chunk_texts_all)} chunks (chunk_max_chars={self.chunk_max_chars}).")
 
         vecs = bi_encoder.encode(
             chunk_texts_all,
@@ -211,7 +359,6 @@ class DenseChunkCacheBuilder:
         free_memory()
 
         meta = {
-            "model_name": getattr(bi_encoder, "model_card_data", None) and None,
             "chars_per_token_init": self.config.chars_per_token_init,
             "safety_margin": self.config.safety_margin,
             "chunk_max_chars": self.chunk_max_chars,
@@ -219,7 +366,7 @@ class DenseChunkCacheBuilder:
             "enable_dieu_title_prefix": self.config.enable_dieu_title_prefix,
             "enable_boilerplate_filter": self.config.enable_boilerplate_filter,
             "enable_line_join_fix": self.config.enable_line_join_fix,
-            "chunk_logic_version": "v4_1_docname_dieutitle_boilerplatefilter_keepgiaithich_linejoinfix_listmarkerfix",
+            "chunk_logic_version": self.chunk_logic_version(),
             "n_docs": len(self.corpus),
         }
         return DenseChunkCache(
@@ -228,6 +375,32 @@ class DenseChunkCacheBuilder:
             chunk_vecs_all=vecs,
             meta=meta,
         )
+
+    def chunk_logic_version(self) -> str:
+        base = "v4_1_docname_dieutitle_boilerplatefilter_keepgiaithich_linejoinfix_listmarkerfix"
+        suffix = self.config.chunk_logic_version_suffix
+        return f"{base}{suffix}" if suffix else base
+
+    def default_cache_path(self, cache_dir: str, model_name: str) -> str:
+        """Hash-versioned cache filename -- identical scheme to the
+        notebook's `make_cache_path()`, so changing the model or any
+        cfg flag never silently collides with a different cache."""
+        cfg = self.config
+        raw = "|".join(
+            [
+                model_name,
+                str(cfg.chars_per_token_init),
+                str(cfg.safety_margin),
+                str(cfg.enable_doc_name_prefix),
+                str(cfg.enable_dieu_title_prefix),
+                str(cfg.enable_boilerplate_filter),
+                str(cfg.enable_line_join_fix),
+                self.chunk_logic_version(),
+            ]
+        )
+        h = hashlib.md5(raw.encode("utf-8")).hexdigest()[:10]
+        safe_model = model_name.replace("/", "_")
+        return f"{cache_dir.rstrip('/')}/dense_chunk_index_{safe_model}_{h}.pkl"
 
 
 class DenseRetriever:
@@ -281,9 +454,7 @@ class DenseRetriever:
         ranked = sorted(doc_best.items(), key=lambda x: x[1], reverse=True)[:top_k]
         return [d for d, _ in ranked]
 
-    def get_all_scored_chunks(
-        self, question: str, doc_ids: List[str]
-    ) -> List[Tuple[str, str, int, float]]:
+    def get_all_scored_chunks(self, question: str, doc_ids: List[str]) -> List[Tuple[str, str, int, float]]:
         """Score every chunk belonging to `doc_ids` against the question.
 
         Returns list of (doc_id, chunk_text, local_pos_in_doc, score).
@@ -303,8 +474,7 @@ class DenseRetriever:
         sims = cand_vecs @ query_vec
 
         return [
-            (doc_id, text, pos, float(s))
-            for (doc_id, text, pos, _gi), s in zip(all_candidate_chunks, sims)
+            (doc_id, text, pos, float(s)) for (doc_id, text, pos, _gi), s in zip(all_candidate_chunks, sims)
         ]
 
     @staticmethod
