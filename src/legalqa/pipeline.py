@@ -1,10 +1,9 @@
-import pickle
 import re
 from collections import defaultdict
 
 import numpy as np
 
-from .chunking import build_hierarchical_chunks_for_doc
+from .child_cache import load_or_build_child_cache
 
 _CHUNK_PREFIX_SPLIT_RE = re.compile(r"^(.{0,200}?\.)\n(.*)$", re.DOTALL)
 
@@ -147,49 +146,10 @@ class LegalQAPipeline:
             self.doc_to_child_positions[str(m["doc_id"])].append(i)
 
     def _load_or_build_child_cache(self):
-        path = self.cfg.child_cache
-        if path.exists():
-            with path.open("rb") as f:
-                payload = pickle.load(f)
-            return (
-                payload["child_texts"],
-                np.ascontiguousarray(payload["child_vecs"], dtype=np.float32),
-                payload["child_meta"],
-            )
-
-        chunks = []
-        for doc_id in self.doc_id_to_passage:
-            chunks.extend(build_hierarchical_chunks_for_doc(
-                doc_id,
-                self.doc_id_to_passage[doc_id],
-                self.doc_id_to_name.get(doc_id, ""),
-            ))
-
-        if len(self.doc_id_to_passage) == 8532 and len(chunks) != 595597:
-            raise RuntimeError(
-                f"Child chunk count mismatch: {len(chunks)} != 595597. "
-                "The 0.5780 experiment used 595,597 child chunks."
-            )
-
-        texts = [c["text"] for c in chunks]
-        meta = [{
-            "doc_id": c["doc_id"],
-            "dieu_num": c["dieu_num"],
-            "khoan_num": c["khoan_num"],
-            "raw_khoan_text": c["raw_khoan_text"],
-        } for c in chunks]
-        vecs = self.retriever.bi_encoder.encode(
-            texts,
-            batch_size=64,
-            show_progress_bar=True,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-        ).astype(np.float32)
-
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("wb") as f:
-            pickle.dump({"child_texts": texts, "child_vecs": vecs, "child_meta": meta}, f)
-        return texts, vecs, meta
+        return load_or_build_child_cache(
+            self.cfg, self.doc_id_to_passage, self.doc_id_to_name,
+            self.retriever.bi_encoder,
+        )
 
     def get_candidate_pool(self, question, top_docs):
         query_vec = self.retriever.get_query_vec(question)[0]

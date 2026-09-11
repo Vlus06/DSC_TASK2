@@ -46,6 +46,7 @@ The parent builder is the supplied v4.1 source, including the corrected `join_br
 ├── scripts/
 │   ├── build_bm25.py
 │   ├── build_dense_parent.py
+│   ├── build_child.py
 │   └── run.py
 ├── src/legalqa/
 └── requirements.txt
@@ -75,6 +76,34 @@ python scripts/run.py --mode full --build-missing
 ```
 
 Submission is written to `outputs/submission.json`.
+
+## Build child cache separately or continue with saved caches
+
+To build only the child cache on Kaggle, after cloning and installing requirements:
+
+```bash
+python -u scripts/build_child.py --device cuda
+```
+
+This loads the corpus and embedding model only; BM25, dense parent caches, and
+the reranker are not needed. It writes `data/cache/child_chunk_vecs_FULL_corpus.pkl`
+in the same format used by the pipeline, and skips building if that file already
+exists. The default batch size is 64; use `--batch-size 16` if GPU memory is
+insufficient. Chunking progress and embedding progress are printed.
+
+To continue validation, place your saved BM25, dense parent, and any completed
+child cache in `data/cache/`, keeping their original filenames, then run:
+
+```bash
+python -u scripts/run.py --mode validate --build-missing
+```
+
+Existing caches are reused and missing caches are built. Cache presence is not
+an integrity check: restore complete files from your successful run. The child
+builder saves through a temporary file so interrupted writes are not mistaken
+for finished caches. It does not resume partially computed embedding batches;
+an interrupted child build starts again. Save completed caches as Kaggle Output
+before ending the session; generated caches are excluded from Git.
 
 ## Important environment note
 

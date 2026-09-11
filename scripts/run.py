@@ -29,10 +29,15 @@ def ensure_base_caches(cfg: PipelineConfig, build_missing: bool):
             "Missing base cache(s):\n" + names +
             "\nRun again with --build-missing to build them from data/."
         )
-    if not cfg.bm25_cache.exists():
-        subprocess.check_call([sys.executable, str(ROOT / "scripts" / "build_bm25.py")])
-    if not cfg.dense_parent_cache.exists():
-        subprocess.check_call([sys.executable, str(ROOT / "scripts" / "build_dense_parent.py")])
+    for path, script in (
+        (cfg.bm25_cache, "build_bm25.py"),
+        (cfg.dense_parent_cache, "build_dense_parent.py"),
+    ):
+        if path.exists():
+            print(f"Using existing cache; skipping build: {path}", flush=True)
+        else:
+            print(f"Missing cache; building: {path}", flush=True)
+            subprocess.check_call([sys.executable, "-u", str(ROOT / "scripts" / script)])
 
 
 def validation_qids(train_raw, cfg: PipelineConfig):
@@ -164,7 +169,7 @@ def main():
 
     import torch
     if torch.cuda.is_available():
-        torch.manual_seed_all(cfg.seed)
+        torch.cuda.manual_seed_all(cfg.seed)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     passages, names = load_corpus()
