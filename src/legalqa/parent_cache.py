@@ -1,4 +1,3 @@
-import hashlib
 import re
 from pathlib import Path
 
@@ -7,7 +6,8 @@ ENABLE_DOC_NAME_PREFIX = True
 ENABLE_DIEU_TITLE_PREFIX = True
 ENABLE_BOILERPLATE_FILTER = True
 ENABLE_LINE_JOIN_FIX = True
-CHUNK_LOGIC_VERSION = "v4_1_docname_dieutitle_boilerplatefilter_keepgiaithich_linejoinfix_listmarkerfix"
+CHUNK_LOGIC_VERSION = "docname_dieutitle_boilerplatefilter_linejoin_listmarker"
+DENSE_PARENT_CACHE_FILENAME = "parent_embeddings.pkl"
 CHARS_PER_TOKEN_INIT = 2.94
 SAFETY_MARGIN = 0.85
 
@@ -33,18 +33,7 @@ BOILERPLATE_TITLE_PATTERN = re.compile(
 
 
 def expected_cache_filename() -> str:
-    raw = "|".join([
-        MODEL_NAME,
-        str(CHARS_PER_TOKEN_INIT),
-        str(SAFETY_MARGIN),
-        str(ENABLE_DOC_NAME_PREFIX),
-        str(ENABLE_DIEU_TITLE_PREFIX),
-        str(ENABLE_BOILERPLATE_FILTER),
-        str(ENABLE_LINE_JOIN_FIX),
-        CHUNK_LOGIC_VERSION,
-    ])
-    h = hashlib.md5(raw.encode("utf-8")).hexdigest()[:10]
-    return f"dense_chunk_index_{MODEL_NAME.replace('/', '_')}_{h}.pkl"
+    return DENSE_PARENT_CACHE_FILENAME
 
 
 def join_broken_lines(text: str) -> str:

@@ -1,4 +1,5 @@
 numpy>=1.26,<3
+pandas>=2.2,<3
 torch>=2.2
 transformers>=4.52,<5
 sentence-transformers>=3,<6
@@ -7,3 +8,5 @@ rank-bm25==0.2.2
 underthesea>=6.8,<9
 nltk>=3.9,<4
 tqdm>=4.66
+sentencepiece>=0.2,<1
+xgboost==3.2.0

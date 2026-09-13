@@ -1,4 +1,4 @@
-"""Shared child cache builder for standalone and full-pipeline runs."""
+"""Build and load hierarchical child-chunk embeddings."""
 import pickle
 
 import numpy as np
@@ -27,11 +27,11 @@ def load_or_build_child_cache(cfg, passages, names, encoder, batch_size=64):
         if i % 500 == 0:
             print(f"Child chunking: {i}/{len(passages)} documents", flush=True)
 
-    print(f"Child chunks: {len(chunks)} (expected notebook value: 595597)", flush=True)
+    print(f"Child chunks: {len(chunks)} (expected: 595597)", flush=True)
     if len(passages) == 8532 and len(chunks) != 595597:
         raise RuntimeError(
             f"Child chunk count mismatch: {len(chunks)} != 595597. "
-            "The 0.5780 experiment used 595,597 child chunks."
+            "Check the corpus and chunking settings."
         )
 
     texts = [c["text"] for c in chunks]

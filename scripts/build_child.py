@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from legalqa.config import PipelineConfig
+from legalqa.config import BaseCacheSettings
 
 
 def main():
@@ -19,7 +19,7 @@ def main():
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
 
-    cfg = PipelineConfig()
+    cfg = BaseCacheSettings()
     if cfg.child_cache.exists():
         print(f"Child cache already exists; skipping build: {cfg.child_cache}", flush=True)
         return
@@ -35,6 +35,10 @@ def main():
     torch.manual_seed(cfg.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(cfg.seed)
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.allow_tf32 = False
     device = args.device
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"

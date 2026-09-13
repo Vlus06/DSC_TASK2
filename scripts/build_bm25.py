@@ -4,11 +4,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 from rank_bm25 import BM25Plus
-from legalqa.config import PipelineConfig, STOPWORDS_FILE
+from legalqa.config import BaseCacheSettings, STOPWORDS_FILE
 from legalqa.corpus import load_corpus
 from legalqa.text_utils import load_stopwords, vi_tokenize_clean
 
-cfg = PipelineConfig()
+cfg = BaseCacheSettings()
 passages, _ = load_corpus()
 stopwords = load_stopwords(STOPWORDS_FILE)
 doc_ids = sorted(passages)
