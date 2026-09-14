@@ -13,6 +13,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
+from .postprocess_v87 import postprocess_v87_final_answer
 from .settings import PipelineSettings
 
 
@@ -865,7 +866,8 @@ class LegalQAEngine:
             kept = [top5[i - 1], top5[j - 1]]
         else:
             raise RuntimeError(f'Unexpected action_size={size}')
-        answer = self.build_answer(question, kept)
+        raw_answer = self.build_answer(question, kept)
+        answer = postprocess_v87_final_answer(raw_answer, question)
         if not return_debug:
             return answer
         member_actions = [[int(r.action_size), int(r.action_i), int(r.action_j)] for r in member_best_rows]
