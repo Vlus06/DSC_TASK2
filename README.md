@@ -264,8 +264,6 @@ Các mục BM25, parent, child, feature cache và model có thể là `false`; w
 
 Để không phải build lại corpus, BM25, parent embedding, child embedding và bốn cache đặc trưng, có thể tải bộ cache dựng sẵn tại [Google Drive — DSC_TASK2_2026](https://drive.google.com/drive/folders/137SYXPgpX82kn1-DZIrFGeZwQkk72cDY).
 
-Chủ sở hữu thư mục Drive cần đặt quyền chia sẻ **Anyone with the link — Viewer** để người khác có thể tải dữ liệu khi tái chạy project.
-
 Sau khi tải, đặt toàn bộ file vào `data/cache/` và kiểm tra đúng tên:
 
 ```text
