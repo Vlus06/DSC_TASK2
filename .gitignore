@@ -5,3 +5,4 @@ outputs/*
 !outputs/.gitkeep
 data/cache/*.pkl
 !data/cache/.gitkeep
+data/models/

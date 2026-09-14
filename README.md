@@ -245,7 +245,8 @@ Workflow xử lý từng artifact độc lập:
 - cache không có ở cả hai nơi: tự build bằng CPU hoặc H100;
 - cache đặc trưng đang làm dở: tiếp tục các qid còn thiếu;
 - cache đặc trưng đã hoàn tất: bỏ qua toàn bộ bước chuẩn bị;
-- model XGBoost: huấn luyện bằng CPU từ tập train;
+- đủ năm model XGBoost và manifest hợp lệ: bỏ qua bước train;
+- thiếu model hoặc cache đặc trưng vừa được build lại: huấn luyện lại bằng CPU;
 - inference: lưu progress định kỳ trong thư mục của run hiện tại.
 
 Modal sử dụng ba Volume:
@@ -257,6 +258,28 @@ Modal sử dụng ba Volume:
 | `legalqa-results` | Output theo từng `run_id` |
 
 Không xóa Volume nếu muốn dùng lại cache và model đã tải trong lần chạy sau.
+
+Năm model XGBoost được lưu bền vững tại:
+
+```text
+legalqa-models/legalqa/
+├── answer_ranker_seed_42.json
+├── answer_ranker_seed_10042.json
+├── answer_ranker_seed_20042.json
+├── answer_ranker_seed_30042.json
+├── answer_ranker_seed_40042.json
+└── training_manifest.json
+```
+
+Tải toàn bộ model về máy để backup hoặc tái sử dụng:
+
+```powershell
+.\.venv\Scripts\python.exe -m modal volume get --force legalqa-models /legalqa .\data\models
+```
+
+Sau khi tải, các file nằm trong `data/models/legalqa/`.
+
+Thư mục `data/models/` được loại khỏi Git vì đây là artifact sinh ra sau khi train.
 
 ## 8. Tệp đầu ra
 

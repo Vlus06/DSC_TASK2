@@ -62,6 +62,7 @@ FEATURE_CACHE_NAMES = {
 PACKED_CORPUS_NAME = "corpus_metadata.pkl"
 FEATURE_MARKER_NAME = "feature_cache_complete.json"
 MODEL_NAMES = [f"answer_ranker_seed_{seed}.json" for seed in (42, 10042, 20042, 30042, 40042)]
+MODEL_MANIFEST_NAME = "training_manifest.json"
 
 
 def _has_file(directory: Path, names: tuple[str, ...]) -> bool:
@@ -115,6 +116,19 @@ def inspect_inputs() -> dict:
         name: (REMOTE_MODELS / name).is_file() and (REMOTE_MODELS / name).stat().st_size > 0
         for name in MODEL_NAMES
     }
+    model_manifest_ready = False
+    model_manifest_path = REMOTE_MODELS / MODEL_MANIFEST_NAME
+    if model_manifest_path.is_file() and model_manifest_path.stat().st_size > 0:
+        try:
+            manifest = json.loads(model_manifest_path.read_text(encoding="utf-8"))
+            model_manifest_ready = (
+                manifest.get("version") == "legalqa_ranker_ensemble_v1"
+                and manifest.get("rows") == 105000
+                and manifest.get("qids") == 7000
+                and manifest.get("seeds") == [42, 10042, 20042, 30042, 40042]
+            )
+        except (OSError, TypeError, ValueError):
+            model_manifest_ready = False
     state = {
         "dataset_ready": dataset_ready,
         "stopwords_ready": stopwords_ready,
@@ -123,6 +137,7 @@ def inspect_inputs() -> dict:
         "feature_caches": feature_caches,
         "feature_marker": _has_file(REMOTE_CACHE, (FEATURE_MARKER_NAME,)),
         "models": models,
+        "model_manifest": model_manifest_ready,
     }
     print(json.dumps(state, ensure_ascii=False, indent=2), flush=True)
     return state
@@ -309,14 +324,19 @@ def workflow(run_id: str, ce_batch_size: int, public_limit: int, checkpoint_ever
         raise RuntimeError("Packed corpus build incomplete")
     if not all(state["base"].values()):
         raise RuntimeError(f"Base cache build incomplete: {state['base']}")
-    if not (all(state["feature_caches"].values()) and state["feature_marker"]):
+    features_rebuilt = not (all(state["feature_caches"].values()) and state["feature_marker"])
+    if features_rebuilt:
         print("[workflow] feature cache missing/incomplete -> H100 prepare", flush=True)
         prepare_features.remote(run_id, ce_batch_size)
     else:
         print("[workflow] four feature caches found -> reuse", flush=True)
 
-    print("[workflow] train five answer rankers -> CPU", flush=True)
-    train_rankers.remote(run_id)
+    models_ready = all(state["models"].values()) and state["model_manifest"]
+    if models_ready and not features_rebuilt:
+        print("[workflow] five trained rankers found -> reuse", flush=True)
+    else:
+        print("[workflow] trained rankers missing/stale -> CPU train", flush=True)
+        train_rankers.remote(run_id)
     print("[workflow] public inference -> H100", flush=True)
     infer_public.remote(run_id, public_limit, checkpoint_every, ce_batch_size)
     print(f"[workflow] DONE: /results/{run_id}", flush=True)
