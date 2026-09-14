@@ -160,7 +160,107 @@ Nếu PowerShell chặn `Activate.ps1`, có thể gọi trực tiếp `.\.venv\S
 
 Modal CLI sẽ mở trình duyệt để xác thực. Không lưu token vào source code, notebook hoặc Git.
 
-### 5.4. Smoke test
+### 5.4. Chuẩn bị dataset trên máy
+
+Sau khi clone repository, đặt dữ liệu đúng cấu trúc sau:
+
+```text
+data/
+├── TASK2/
+│   ├── train.json
+│   ├── public-official.json
+│   └── selected-contexts/
+│       ├── context_....json
+│       └── ...
+├── cache/
+└── stopwords.txt
+```
+
+`selected-contexts/` phải chứa đủ các file JSON của corpus. Với bộ dữ liệu dùng trong project, code kiểm tra đúng 8.532 tài liệu. Không đổi tên `train.json`, `public-official.json`, `selected-contexts` hoặc `stopwords.txt` vì workflow dùng các đường dẫn này để nhận diện dữ liệu.
+
+Đặt biến mã hóa UTF-8 trước khi dùng Modal CLI trên Windows để terminal in được log tiếng Việt và ký hiệu kiểm tra:
+
+```powershell
+$env:PYTHONIOENCODING = "utf-8"
+```
+
+### 5.5. Nạp dataset lên Modal Volume
+
+Workflow sử dụng Volume `legalqa-data`. Tạo Volume một lần; nếu Volume đã tồn tại thì bỏ qua lệnh tạo:
+
+```powershell
+.\.venv\Scripts\python.exe -m modal volume create legalqa-data
+```
+
+Nạp dataset và stopwords:
+
+```powershell
+.\.venv\Scripts\python.exe -m modal volume put --force `
+  legalqa-data .\data\TASK2 /TASK2
+
+.\.venv\Scripts\python.exe -m modal volume put --force `
+  legalqa-data .\data\stopwords.txt /stopwords.txt
+```
+
+Lần chạy `modal_app.py` đầu tiên cũng có thể tự upload hai đầu vào này nếu chúng còn thiếu trên Volume. Các lệnh `volume put` ở trên hữu ích khi muốn chuẩn bị và kiểm tra dữ liệu trước khi bắt đầu pipeline dài.
+
+Kiểm tra các file đã có trên Volume:
+
+```powershell
+.\.venv\Scripts\python.exe -m modal volume ls legalqa-data /TASK2
+.\.venv\Scripts\python.exe -m modal volume ls legalqa-data /cache
+```
+
+### 5.6. Tạo và sử dụng `corpus_metadata.pkl`
+
+`corpus_metadata.pkl` là bản đóng gói của 8.532 file trong `selected-contexts/`. File chứa ba bảng ánh xạ `passages`, `names` và `links`. Nó giúp các stage sau đọc corpus từ một file pickle thay vì mở lại hàng nghìn file JSON nhỏ.
+
+Sau khi dataset đã nằm trên `legalqa-data`, tạo file này bằng CPU trên Modal:
+
+```powershell
+.\.venv\Scripts\python.exe -m modal run .\modal_app.py::pack_corpus
+```
+
+Code thực hiện nằm trong hàm `pack_corpus()` của `scripts/modal_stages.py`. Stage đọc toàn bộ `data/TASK2/selected-contexts/*.json`, kiểm tra đủ 8.532 tài liệu rồi lưu file bền vững tại:
+
+```text
+Volume: legalqa-data
+Đường dẫn: /cache/corpus_metadata.pkl
+```
+
+Nếu đã có bản backup `data/cache/corpus_metadata.pkl` trên máy, có thể nạp thẳng lên Volume và bỏ qua bước quét 8.532 file JSON:
+
+```powershell
+.\.venv\Scripts\python.exe -m modal volume put --force `
+  legalqa-data .\data\cache\corpus_metadata.pkl /cache/corpus_metadata.pkl
+```
+
+Có thể tải file đã build trên Modal về máy để dùng lại cho lần sau:
+
+```powershell
+.\.venv\Scripts\python.exe -m modal volume get --force `
+  legalqa-data /cache/corpus_metadata.pkl .\data\cache
+```
+
+Không cần chạy lại `pack_corpus` nếu `/cache/corpus_metadata.pkl` đã tồn tại và có dữ liệu. Workflow đầy đủ cũng tự gọi stage này khi file còn thiếu, nhưng chạy riêng trước giúp xác nhận corpus đã được đóng gói trước khi bắt đầu các bước tốn thời gian hơn.
+
+Kiểm tra toàn bộ trạng thái đầu vào và cache:
+
+```powershell
+.\.venv\Scripts\python.exe -m modal run .\modal_app.py::inspect_inputs
+```
+
+Trạng thái sẵn sàng tối thiểu trước lần chạy đầu phải có:
+
+```text
+"dataset_ready": true
+"stopwords_ready": true
+"packed_corpus": true
+```
+
+Các mục BM25, parent, child, feature cache và model có thể là `false`; workflow sẽ build phần còn thiếu rồi lưu lại trên Volume.
+
+### 5.7. Smoke test
 
 Chạy thử 10 câu để kiểm tra môi trường, model và định dạng output:
 
@@ -172,7 +272,7 @@ Chạy thử 10 câu để kiểm tra môi trường, model và định dạng o
 
 Smoke test tạo file `submission_smoke_10.json`. File này chỉ dùng để kiểm tra pipeline.
 
-### 5.5. Chạy đầy đủ tập public
+### 5.8. Chạy đầy đủ tập public
 
 ```powershell
 .\.venv\Scripts\python.exe -m modal run .\modal_app.py `
@@ -195,7 +295,7 @@ Starting cost-aware workflow; Run ID: <run_id>
 
 Giữ lại `run_id` để tra log hoặc tải output từ Modal Volume.
 
-### 5.6. Chạy tách khỏi terminal
+### 5.9. Chạy tách khỏi terminal
 
 ```powershell
 .\.venv\Scripts\python.exe -m modal run --detach .\modal_app.py `
