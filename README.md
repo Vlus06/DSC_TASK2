@@ -278,7 +278,7 @@ data/cache/
 └── singleton_features.pkl
 ```
 
-Tên file phải khớp hoàn toàn với danh sách trên. Nếu file tải từ Drive có tên `parent_embeddings` hoặc `child_embeddings` nhưng thiếu phần mở rộng, đổi tên thành `parent_embeddings.pkl` và `child_embeddings.pkl`; nếu không, workflow sẽ xem cache là chưa tồn tại và build lại.
+Tên file phải khớp hoàn toàn với danh sách trên
 
 Nạp toàn bộ thư mục cache lên Modal Volume:
 
