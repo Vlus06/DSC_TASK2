@@ -260,7 +260,46 @@ Trạng thái sẵn sàng tối thiểu trước lần chạy đầu phải có:
 
 Các mục BM25, parent, child, feature cache và model có thể là `false`; workflow sẽ build phần còn thiếu rồi lưu lại trên Volume.
 
-### 5.7. Smoke test
+### 5.7. Tải cache dựng sẵn từ Google Drive
+
+Để không phải build lại corpus, BM25, parent embedding, child embedding và bốn cache đặc trưng, có thể tải bộ cache dựng sẵn tại [Google Drive — DSC_TASK2_2026](https://drive.google.com/drive/folders/137SYXPgpX82kn1-DZIrFGeZwQkk72cDY).
+
+Chủ sở hữu thư mục Drive cần đặt quyền chia sẻ **Anyone with the link — Viewer** để người khác có thể tải dữ liệu khi tái chạy project.
+
+Sau khi tải, đặt toàn bộ file vào `data/cache/` và kiểm tra đúng tên:
+
+```text
+data/cache/
+├── bm25_index.pkl
+├── parent_embeddings.pkl
+├── child_embeddings.pkl
+├── corpus_metadata.pkl
+├── top_documents.pkl
+├── candidate_audit.pkl
+├── pair_features.pkl
+└── singleton_features.pkl
+```
+
+Tên file phải khớp hoàn toàn với danh sách trên. Nếu file tải từ Drive có tên `parent_embeddings` hoặc `child_embeddings` nhưng thiếu phần mở rộng, đổi tên thành `parent_embeddings.pkl` và `child_embeddings.pkl`; nếu không, workflow sẽ xem cache là chưa tồn tại và build lại.
+
+Nạp toàn bộ thư mục cache lên Modal Volume:
+
+```powershell
+.\.venv\Scripts\python.exe -m modal volume put --force `
+  legalqa-data .\data\cache /cache
+```
+
+Sau khi upload, kiểm tra:
+
+```powershell
+.\.venv\Scripts\python.exe -m modal run .\modal_app.py::inspect_inputs
+```
+
+Kết quả phải có `packed_corpus: true`; ba mục trong `base` và bốn mục trong `feature_caches` đều là `true`. Bộ cache trên Drive không thay thế dataset: vẫn phải nạp `train.json`, `public-official.json`, thư mục `selected-contexts/` và `stopwords.txt` theo mục 5.5.
+
+Nếu `feature_marker` là `false` trong lần nhập cache đầu tiên, workflow sẽ đọc và kiểm tra bốn cache đặc trưng rồi tạo `feature_cache_complete.json` trên Volume. Các cache corpus, BM25 và embedding hợp lệ vẫn được dùng lại, không bị build lại.
+
+### 5.8. Smoke test
 
 Chạy thử 10 câu để kiểm tra môi trường, model và định dạng output:
 
@@ -272,7 +311,7 @@ Chạy thử 10 câu để kiểm tra môi trường, model và định dạng o
 
 Smoke test tạo file `submission_smoke_10.json`. File này chỉ dùng để kiểm tra pipeline.
 
-### 5.8. Chạy đầy đủ tập public
+### 5.9. Chạy đầy đủ tập public
 
 ```powershell
 .\.venv\Scripts\python.exe -m modal run .\modal_app.py `
@@ -295,7 +334,7 @@ Starting cost-aware workflow; Run ID: <run_id>
 
 Giữ lại `run_id` để tra log hoặc tải output từ Modal Volume.
 
-### 5.9. Chạy tách khỏi terminal
+### 5.10. Chạy tách khỏi terminal
 
 ```powershell
 .\.venv\Scripts\python.exe -m modal run --detach .\modal_app.py `
