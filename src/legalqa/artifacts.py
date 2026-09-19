@@ -41,6 +41,31 @@ def load_json(path: Path):
         return json.load(f)
 
 
+def load_evaluation_questions(task2_dir: Path, split: str = 'public'):
+    filenames = {
+        'public': 'public-official.json',
+        'private': 'private-official.json',
+    }
+    if split not in filenames:
+        raise ValueError(f'Unsupported evaluation split: {split}')
+    path = Path(task2_dir) / filenames[split]
+    if not path.is_file():
+        raise FileNotFoundError(f'Missing {split} evaluation file: {path}')
+    questions = load_json(path)
+    if not isinstance(questions, dict):
+        raise RuntimeError(f'Unexpected {split} evaluation schema: {path}')
+    invalid = [
+        str(qid) for qid, item in questions.items()
+        if not isinstance(item, dict) or not str(item.get('question', '')).strip()
+    ]
+    if invalid:
+        raise RuntimeError(
+            f'{split} evaluation contains {len(invalid)} invalid questions; '
+            f'first={invalid[0]}'
+        )
+    return questions
+
+
 def load_corpus_metadata(task2_dir: Path):
     task2_dir = Path(task2_dir)
     context_dir = task2_dir / 'selected-contexts'

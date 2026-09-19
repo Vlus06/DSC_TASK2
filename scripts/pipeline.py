@@ -181,6 +181,23 @@ def train_answer_rankers(cfg, actions, output_dir: Path):
     return models
 
 
+def inference_artifact_names(dataset_name: str, full_run: bool, selected_count: int):
+    if dataset_name not in {'public', 'private'}:
+        raise ValueError(f'Unsupported inference dataset: {dataset_name}')
+    label = '' if dataset_name == 'public' else '_private'
+    if full_run:
+        return (
+            f'inference{label}_progress.pkl',
+            f'submission{label}.json',
+            f'inference_log{label}.json',
+        )
+    return (
+        f'inference{label}_smoke_progress.pkl',
+        f'submission{label}_smoke_{selected_count}.json',
+        f'inference_log{label}_smoke_{selected_count}.json',
+    )
+
+
 def run_public_inference(
     cfg,
     engine,
@@ -189,20 +206,19 @@ def run_public_inference(
     output_dir: Path,
     limit: int = 0,
     checkpoint_every: int = 25,
+    dataset_name: str = 'public',
 ):
     output_dir.mkdir(parents=True, exist_ok=True)
     full_run = not limit or limit >= len(public)
     selected_public = list(public.items()) if full_run else list(public.items())[:limit]
-
-    progress_path = output_dir / (
-        "inference_progress.pkl" if full_run else "inference_smoke_progress.pkl"
+    progress_name, submission_name, log_name = inference_artifact_names(
+        dataset_name,
+        full_run,
+        len(selected_public),
     )
-    submission_path = output_dir / (
-        "submission.json" if full_run else f"submission_smoke_{len(selected_public)}.json"
-    )
-    log_path = output_dir / (
-        "inference_log.json" if full_run else f"inference_log_smoke_{len(selected_public)}.json"
-    )
+    progress_path = output_dir / progress_name
+    submission_path = output_dir / submission_name
+    log_path = output_dir / log_name
 
     predictions, inference_log = {}, []
     if progress_path.exists():
@@ -234,7 +250,7 @@ def run_public_inference(
             progress_path,
         )
 
-    print(f"PUBLIC todo={len(pending)}", flush=True)
+    print(f"{dataset_name.upper()} todo={len(pending)}", flush=True)
     started = time.time()
     for index, (qid, item) in enumerate(pending, start=1):
         item_started = time.time()

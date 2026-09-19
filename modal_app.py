@@ -100,6 +100,7 @@ def inspect_inputs() -> dict:
     task2 = APP_DATA / "TASK2"
     train = task2 / "train.json"
     public = task2 / "public-official.json"
+    private = task2 / "private-official.json"
     context_dirs = [task2 / "selected-contexts", task2 / "selected-contexts/selected-contexts"]
     context_dir = next((p for p in context_dirs if p.is_dir()), None)
     dataset_ready = train.is_file() and public.is_file() and context_dir is not None
@@ -131,6 +132,7 @@ def inspect_inputs() -> dict:
             model_manifest_ready = False
     state = {
         "dataset_ready": dataset_ready,
+        "private_ready": private.is_file() and private.stat().st_size > 0,
         "stopwords_ready": stopwords_ready,
         "packed_corpus": _has_file(REMOTE_CACHE, (PACKED_CORPUS_NAME,)),
         "base": base,
@@ -300,6 +302,30 @@ def infer_public(run_id: str, public_limit: int, checkpoint_every: int, ce_batch
         models_volume.commit()
 
 
+@app.function(
+    image=gpu_image, volumes=ALL_VOLUMES, gpu="H100", cpu=16,
+    memory=131072, timeout=24 * 3600, scaledown_window=30,
+)
+def infer_private(run_id: str, private_limit: int, checkpoint_every: int, ce_batch_size: int) -> None:
+    for volume in (data_volume, results_volume, models_volume):
+        volume.reload()
+    out = REMOTE_RESULTS / run_id
+    try:
+        _stream(
+            [
+                sys.executable, "-u", "/app/scripts/modal_stages.py", "infer-private",
+                "--run-dir", str(out),
+                "--private-limit", str(private_limit),
+                "--checkpoint-every", str(checkpoint_every),
+                "--ce-batch-size", str(ce_batch_size),
+            ],
+            out / "03_infer_private.log",
+        )
+    finally:
+        results_volume.commit()
+        models_volume.commit()
+
+
 @app.function(image=cpu_image, volumes=ALL_VOLUMES, cpu=0.25, memory=512, timeout=24 * 3600)
 def workflow(run_id: str, ce_batch_size: int, public_limit: int, checkpoint_every: int) -> str:
     print(f"Run ID: {run_id}", flush=True)
@@ -350,6 +376,10 @@ def _sync_local_inputs(state: dict) -> bool:
         uploads.append(("dir", ROOT / "data/TASK2", "/TASK2"))
     if not state["stopwords_ready"]:
         uploads.append(("file", ROOT / "data/stopwords.txt", "/stopwords.txt"))
+    if not state.get("private_ready", False):
+        private = ROOT / "data/TASK2/private-official.json"
+        if private.is_file():
+            uploads.append(("file", private, "/TASK2/private-official.json"))
     for key, ready in state["base"].items():
         local = ROOT / "data/cache" / BASE_CACHE_NAMES[key]
         if not ready and local.is_file():
@@ -387,14 +417,63 @@ def _download_outputs(run_id: str, public_limit: int) -> Path:
     return destination
 
 
+def _download_private_outputs(run_id: str, private_limit: int) -> Path:
+    destination = ROOT / "outputs/modal" / run_id
+    destination.mkdir(parents=True, exist_ok=True)
+    names = [
+        "03_infer_private.log", "run_manifest.json",
+        (
+            f"submission_private_smoke_{private_limit}.json"
+            if private_limit else "submission_private.json"
+        ),
+        (
+            f"inference_log_private_smoke_{private_limit}.json"
+            if private_limit else "inference_log_private.json"
+        ),
+    ]
+    for name in names:
+        try:
+            content = b"".join(results_volume.read_file(f"/{run_id}/{name}"))
+        except Exception:
+            continue
+        (destination / name).write_bytes(content)
+    return destination
+
+
 @app.local_entrypoint()
-def main(public_limit: int = 0, ce_batch_size: int = 32, checkpoint_every: int = 25):
+def main(
+    dataset: str = "public",
+    public_limit: int = 0,
+    private_limit: int = 0,
+    ce_batch_size: int = 32,
+    checkpoint_every: int = 25,
+):
+    if dataset not in {"public", "private"}:
+        raise ValueError("dataset must be public or private")
     if not 0 <= public_limit <= 1000:
         raise ValueError("public_limit must be in 0..1000")
-    run_id = uuid.uuid4().hex
+    if not 0 <= private_limit <= 10000:
+        raise ValueError("private_limit must be in 0..10000")
     state = inspect_inputs.remote()
     if _sync_local_inputs(state):
         state = inspect_inputs.remote()
+    if dataset == "private":
+        if not state["dataset_ready"] or not state["stopwords_ready"]:
+            raise RuntimeError("TASK2 dataset/stopwords is missing on legalqa-data")
+        if not state.get("private_ready", False):
+            raise RuntimeError("private-official.json is missing on legalqa-data")
+        if not all(state["base"].values()):
+            raise RuntimeError(f"Base cache is incomplete: {state['base']}")
+        if not all(state["models"].values()) or not state["model_manifest"]:
+            raise RuntimeError("Trained rankers are missing or invalid")
+        run_id = f"private-{uuid.uuid4().hex}"
+        print(f"Starting private inference; Run ID: {run_id}", flush=True)
+        infer_private.remote(run_id, private_limit, checkpoint_every, ce_batch_size)
+        destination = _download_private_outputs(run_id, private_limit)
+        print(f"Downloaded private outputs to: {destination}", flush=True)
+        return
+
+    run_id = uuid.uuid4().hex
     print(f"Starting cost-aware workflow; Run ID: {run_id}", flush=True)
     workflow.remote(run_id, ce_batch_size, public_limit, checkpoint_every)
     destination = _download_outputs(run_id, public_limit)

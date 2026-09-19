@@ -127,8 +127,8 @@ def load_complete_features(cfg, base1000, holdout1000, training5000):
     return audit, pair, single
 
 
-def load_context(*, load_models: bool, ce_batch_size: int = 32):
-    from legalqa.artifacts import load_task2, split_training_data
+def load_context(*, load_models: bool, ce_batch_size: int = 32, evaluation_split: str = "public"):
+    from legalqa.artifacts import load_evaluation_questions, load_task2, split_training_data
     from legalqa.engine import LegalQAEngine, configure_cuda, ensure_nltk_resources
     from legalqa.settings import PipelineSettings
     from legalqa.text_utils import load_stopwords
@@ -138,7 +138,12 @@ def load_context(*, load_models: bool, ce_batch_size: int = 32):
     ensure_nltk_resources()
     _, train, public, passages, names, links = load_task2(TASK2)
     train = {str(k): value for k, value in train.items()}
-    public = {str(k): value for k, value in public.items()}
+    evaluation = (
+        public
+        if evaluation_split == "public"
+        else load_evaluation_questions(TASK2, evaluation_split)
+    )
+    evaluation = {str(k): value for k, value in evaluation.items()}
     if load_models:
         engine = LegalQAEngine(
             cfg,
@@ -167,7 +172,7 @@ def load_context(*, load_models: bool, ce_batch_size: int = 32):
         engine.bi_encoder = None
         engine.cross_encoder = None
         print("[train] lightweight answer-builder ready; base vectors not loaded", flush=True)
-    return cfg, train, public, engine, split_training_data(train, cfg.seed)
+    return cfg, train, evaluation, engine, split_training_data(train, cfg.seed)
 
 
 def train_rankers(run_dir: Path) -> None:
@@ -266,15 +271,58 @@ def infer_public(
     print("[infer] DONE", flush=True)
 
 
+def infer_private(
+    run_dir: Path,
+    private_limit: int,
+    checkpoint_every: int,
+    ce_batch_size: int,
+) -> None:
+    from pipeline import run_public_inference
+
+    cfg, _train, private, engine, _split = load_context(
+        load_models=True,
+        ce_batch_size=ce_batch_size,
+        evaluation_split="private",
+    )
+    models = load_rankers(cfg)
+    submission, inference_log = run_public_inference(
+        cfg,
+        engine,
+        models,
+        private,
+        run_dir,
+        limit=private_limit,
+        checkpoint_every=checkpoint_every,
+        dataset_name="private",
+    )
+    manifest = {
+        "version": "legalqa_modal_run_v1",
+        "dataset": "private",
+        "private_limit": private_limit,
+        "submission": submission.name,
+        "inference_log": inference_log.name,
+        "ce_batch_size": ce_batch_size,
+        "model_seeds": list(cfg.model_seeds),
+    }
+    (run_dir / "run_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print("[infer-private] DONE", flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "stage",
-        choices=["pack-corpus", "build-bm25", "build-dense", "build-child", "train", "infer"],
+        choices=[
+            "pack-corpus", "build-bm25", "build-dense", "build-child",
+            "train", "infer", "infer-private",
+        ],
     )
     parser.add_argument("--run-dir", type=Path, default=Path("/results/manual"))
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--public-limit", type=int, default=0)
+    parser.add_argument("--private-limit", type=int, default=0)
     parser.add_argument("--checkpoint-every", type=int, default=25)
     parser.add_argument("--ce-batch-size", type=int, default=32)
     args = parser.parse_args()
@@ -285,10 +333,17 @@ def main() -> None:
         build_base(args.stage.removeprefix("build-"), args.batch_size)
     elif args.stage == "train":
         train_rankers(args.run_dir)
-    else:
+    elif args.stage == "infer":
         infer_public(
             args.run_dir,
             args.public_limit,
+            args.checkpoint_every,
+            args.ce_batch_size,
+        )
+    else:
+        infer_private(
+            args.run_dir,
+            args.private_limit,
             args.checkpoint_every,
             args.ce_batch_size,
         )
