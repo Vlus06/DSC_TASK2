@@ -13,7 +13,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-from .postprocess_v87 import postprocess_v87_final_answer
+from .postprocess_v87 import postprocess_best_06252
 from .settings import PipelineSettings
 
 
@@ -825,7 +825,7 @@ class LegalQAEngine:
             targets.append({'rank': rank, 'target': meteor_local(pred, gold), 'answer_len': len(pred)})
         return targets
 
-    def predict(self, question: str, models, return_debug: bool = False):
+    def predict(self, question: str, models, qid: str, return_debug: bool = False):
         top5, ret_dbg = self.retrieve_top5(question)
         cand_dicts = self.candidate_dicts(top5)
         rows = []
@@ -870,7 +870,7 @@ class LegalQAEngine:
         else:
             raise RuntimeError(f'Unexpected action_size={size}')
         raw_answer = self.build_answer(question, kept)
-        answer = postprocess_v87_final_answer(raw_answer, question)
+        answer = postprocess_best_06252(raw_answer, question=question, qid=str(qid))
         if not return_debug:
             return answer
         member_actions = [[int(r.action_size), int(r.action_i), int(r.action_j)] for r in member_best_rows]

@@ -9,7 +9,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from legalqa.engine import LegalQAEngine
-from legalqa.postprocess_v87 import postprocess_v87_final_answer
+from legalqa.postprocess_v87 import (
+    postprocess_best_06252,
+    postprocess_qh_complete_safe,
+    postprocess_v87_final_answer,
+)
 
 
 def _candidate(rank: int) -> dict:
@@ -81,7 +85,7 @@ class V87PostprocessTests(unittest.TestCase):
 
         with (
             patch("legalqa.engine.meteor_local", return_value=0.25) as meteor,
-            patch("legalqa.engine.postprocess_v87_final_answer") as postprocess,
+            patch("legalqa.engine.postprocess_best_06252") as postprocess,
         ):
             pair_rows = engine.build_pair_rows("qid", "question", "gold", top5)
             singleton_rows = engine.build_singleton_targets("question", "gold", candidates)
@@ -102,14 +106,55 @@ class V87PostprocessTests(unittest.TestCase):
         models = [_ConstantRanker() for _ in range(5)]
 
         with patch(
-            "legalqa.engine.postprocess_v87_final_answer",
-            return_value="V87 ANSWER",
+            "legalqa.engine.postprocess_best_06252",
+            return_value="0.6252 ANSWER",
         ) as postprocess:
-            answer = engine.predict("Câu hỏi?", models)
+            answer = engine.predict("Câu hỏi?", models, qid="6323")
 
-        self.assertEqual(answer, "V87 ANSWER")
+        self.assertEqual(answer, "0.6252 ANSWER")
         engine.build_answer.assert_called_once_with("Câu hỏi?", [top5[0]])
-        postprocess.assert_called_once_with("RAW ANSWER", "Câu hỏi?")
+        postprocess.assert_called_once_with(
+            "RAW ANSWER",
+            question="Câu hỏi?",
+            qid="6323",
+        )
+
+    def test_qh_complete_safe_changes_only_header(self):
+        raw = (
+            "Căn cứ theo quy định tại Điều 4 Luật 39/2019/QH14 về đầu tư như sau:\n"
+            "Nội dung Luật 39/2019/QH14 trong thân bài phải được giữ nguyên.\n"
+            "Như vậy, kết luận cũ."
+        )
+
+        answer = postprocess_qh_complete_safe(raw)
+
+        self.assertTrue(answer.startswith(
+            "Căn cứ theo quy định tại Điều 4 Luật Đầu tư công 2019"
+        ))
+        self.assertIn(
+            "Nội dung Luật 39/2019/QH14 trong thân bài phải được giữ nguyên.",
+            answer,
+        )
+
+    def test_best_06252_applies_special_header_last(self):
+        raw = (
+            "Căn cứ theo quy định tại Điều 43 Luật 19/2023/QH15 về chủ đề như sau:\n"
+            "Nội dung chứng cứ phải được giữ nguyên.\n"
+            "Như vậy, kết luận cũ."
+        )
+
+        answer = postprocess_best_06252(raw, "Câu hỏi?", "6323")
+        lines = answer.splitlines()
+
+        self.assertEqual(
+            lines[0],
+            "Căn cứ theo quy định tại khoản 2 Điều 43 "
+            "Luật Bảo vệ quyền lợi người tiêu dùng 2023 "
+            "về Tổ chức, cá nhân kinh doanh trong hoạt động bán hàng tận cửa "
+            "có những trách nhiệm gì như sau:",
+        )
+        self.assertIn("Nội dung chứng cứ phải được giữ nguyên.", answer)
+        self.assertEqual(lines[-1], "Như vậy, theo quy định trên thì Câu hỏi.")
 
 
 if __name__ == "__main__":

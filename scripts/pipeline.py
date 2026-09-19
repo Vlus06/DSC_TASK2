@@ -279,6 +279,7 @@ def run_public_inference(
             prediction, debug = engine.predict(
                 item["question"],
                 models,
+                qid=qid,
                 return_debug=True,
             )
             error = None

@@ -118,7 +118,9 @@ class PrivateInferenceTests(unittest.TestCase):
             )
             predictions = json.loads(submission.read_text(encoding="utf-8"))
 
-        engine.predict.assert_called_once_with("retry me", [], return_debug=True)
+            engine.predict.assert_called_once_with(
+                "retry me", [], qid="retry", return_debug=True,
+            )
         self.assertEqual(predictions["ok"]["answer"], "existing")
         self.assertEqual(predictions["retry"]["answer"], "recovered")
         self.assertEqual(
