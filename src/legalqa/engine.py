@@ -770,8 +770,11 @@ class LegalQAEngine:
         if not pool:
             raise RuntimeError('Retrieval produced an empty candidate pool')
         candidates = sorted(pool, key=lambda x: -x[2])[:self.cfg.pre_ce_top_k]
-        if len(candidates) != self.cfg.pre_ce_top_k:
-            raise RuntimeError(f'Expected embedding top10, got {len(candidates)}')
+        if len(candidates) < self.cfg.ce_top_k:
+            raise RuntimeError(
+                f'Expected at least {self.cfg.ce_top_k} embedding candidates, '
+                f'got {len(candidates)}'
+            )
         reranked = sorted(self.ce_score_candidates(question, candidates), key=lambda x: -x[3])
         top5 = reranked[:self.cfg.ce_top_k]
         if len(top5) != self.cfg.ce_top_k:

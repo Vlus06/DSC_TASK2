@@ -227,6 +227,27 @@ def run_public_inference(
         if progress.get("version") == "legalqa_inference_progress_v1":
             predictions = {str(key): value for key, value in progress.get("predictions", {}).items()}
             inference_log = progress.get("inference_log", [])
+            retry_qids = {
+                str(qid) for qid, value in predictions.items()
+                if not str(value.get("answer", "")).strip()
+            }
+            retry_qids.update(
+                str(row.get("qid")) for row in inference_log
+                if row.get("error") is not None
+            )
+            if retry_qids:
+                predictions = {
+                    qid: value for qid, value in predictions.items()
+                    if qid not in retry_qids
+                }
+                inference_log = [
+                    row for row in inference_log
+                    if str(row.get("qid")) not in retry_qids
+                ]
+                print(
+                    f"Retrying {len(retry_qids)} failed/empty predictions from checkpoint",
+                    flush=True,
+                )
             print(
                 f"Loaded inference progress: {len(predictions)}/{len(selected_public)}",
                 flush=True,

@@ -445,6 +445,7 @@ def main(
     dataset: str = "public",
     public_limit: int = 0,
     private_limit: int = 0,
+    resume_run_id: str = "",
     ce_batch_size: int = 32,
     checkpoint_every: int = 25,
 ):
@@ -454,6 +455,8 @@ def main(
         raise ValueError("public_limit must be in 0..1000")
     if not 0 <= private_limit <= 10000:
         raise ValueError("private_limit must be in 0..10000")
+    if dataset != "private" and resume_run_id:
+        raise ValueError("resume_run_id is supported only for private inference")
     state = inspect_inputs.remote()
     if _sync_local_inputs(state):
         state = inspect_inputs.remote()
@@ -466,7 +469,7 @@ def main(
             raise RuntimeError(f"Base cache is incomplete: {state['base']}")
         if not all(state["models"].values()) or not state["model_manifest"]:
             raise RuntimeError("Trained rankers are missing or invalid")
-        run_id = f"private-{uuid.uuid4().hex}"
+        run_id = resume_run_id.strip() or f"private-{uuid.uuid4().hex}"
         print(f"Starting private inference; Run ID: {run_id}", flush=True)
         infer_private.remote(run_id, private_limit, checkpoint_every, ce_batch_size)
         destination = _download_private_outputs(run_id, private_limit)
