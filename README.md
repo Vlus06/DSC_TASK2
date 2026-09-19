@@ -71,6 +71,7 @@ DSC_TASK2/
 │   ├── TASK2/
 │   │   ├── train.json
 │   │   ├── public-official.json
+│   │   ├── private-official.json
 │   │   └── selected-contexts/
 │   ├── cache/
 │   └── stopwords.txt
@@ -95,6 +96,7 @@ Các đầu vào bắt buộc:
 ```text
 data/TASK2/train.json
 data/TASK2/public-official.json
+data/TASK2/private-official.json    # chỉ bắt buộc khi chạy private test
 data/TASK2/selected-contexts/
 data/stopwords.txt
 ```
@@ -169,6 +171,7 @@ data/
 ├── TASK2/
 │   ├── train.json
 │   ├── public-official.json
+│   ├── private-official.json
 │   └── selected-contexts/
 │       ├── context_....json
 │       └── ...
@@ -176,7 +179,7 @@ data/
 └── stopwords.txt
 ```
 
-`selected-contexts/` phải chứa đủ các file JSON của corpus. Với bộ dữ liệu dùng trong project, code kiểm tra đúng 8.532 tài liệu. Không đổi tên `train.json`, `public-official.json`, `selected-contexts` hoặc `stopwords.txt` vì workflow dùng các đường dẫn này để nhận diện dữ liệu.
+`selected-contexts/` phải chứa đủ các file JSON của corpus. Với bộ dữ liệu dùng trong project, code kiểm tra đúng 8.532 tài liệu. `private-official.json` chỉ cần khi chạy private test. Không đổi tên `train.json`, `public-official.json`, `private-official.json`, `selected-contexts` hoặc `stopwords.txt` vì workflow dùng các đường dẫn này để nhận diện dữ liệu.
 
 Đặt biến mã hóa UTF-8 trước khi dùng Modal CLI trên Windows để terminal in được log tiếng Việt và ký hiệu kiểm tra:
 
@@ -343,6 +346,87 @@ Giữ lại `run_id` để tra log hoặc tải output từ Modal Volume.
 
 Có thể đóng terminal sau khi app đã khởi động. Trạng thái và log được theo dõi trên Modal Dashboard.
 
+### 5.11. Chạy private test và tạo file nộp
+
+Đặt tập private đúng tên và đúng vị trí trên máy:
+
+```text
+data/TASK2/private-official.json
+```
+
+Kiểm tra trạng thái dataset, cache và model trên Modal:
+
+```powershell
+.\.venv\Scripts\python.exe -m modal run .\modal_app.py::inspect_inputs
+```
+
+Nếu file đã có trên Volume, kết quả sẽ hiển thị `private_ready: true`. Nếu `private_ready` còn là `false` nhưng file private đã có trên máy, lệnh chạy private bên dưới sẽ tự upload file lên `legalqa-data/TASK2/private-official.json` rồi kiểm tra lại.
+
+Có thể smoke test 10 câu trước:
+
+```powershell
+.\.venv\Scripts\python.exe -m modal run .\modal_app.py `
+  --dataset private `
+  --private-limit 10 `
+  --ce-batch-size 32 `
+  --checkpoint-every 25
+```
+
+Smoke test tạo `submission_private_smoke_10.json`; không dùng file này để nộp.
+
+Chạy toàn bộ private test:
+
+```powershell
+.\.venv\Scripts\python.exe -m modal run .\modal_app.py `
+  --dataset private `
+  --private-limit 0 `
+  --ce-batch-size 32 `
+  --checkpoint-every 25
+```
+
+`--private-limit 0` có nghĩa là chạy toàn bộ tập private. Workflow tái sử dụng corpus đã đóng gói, BM25, embedding parent/child và năm ranker đã có; nhánh này không build cache, prepare feature hoặc train lại model. Inference chạy trên H100 và lưu checkpoint sau mỗi 25 câu.
+
+Khi hoàn tất, terminal in:
+
+```text
+Starting private inference; Run ID: private-<id>
+Downloaded private outputs to: ...\outputs\modal\private-<id>
+```
+
+File dùng để nộp là:
+
+```text
+outputs/modal/private-<id>/submission_private.json
+```
+
+Tìm nhanh file private mới nhất:
+
+```powershell
+Get-ChildItem .\outputs\modal -Recurse -Filter submission_private.json |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 1 FullName, Length, LastWriteTime
+```
+
+Nếu terminal bị ngắt hoặc một số câu bị lỗi, giữ lại `run_id` và chạy tiếp sau khi đã sửa nguyên nhân:
+
+```powershell
+.\.venv\Scripts\python.exe -m modal run .\modal_app.py `
+  --dataset private `
+  --private-limit 0 `
+  --resume-run-id private-<id> `
+  --ce-batch-size 32 `
+  --checkpoint-every 25
+```
+
+Chế độ resume đọc checkpoint trong chính thư mục run cũ, giữ các câu đã thành công và chỉ chạy lại câu bị lỗi hoặc có answer rỗng.
+
+Nếu inference đã xong trên Modal nhưng terminal không tải file về, dùng chính `run_id` đó:
+
+```powershell
+.\.venv\Scripts\python.exe -m modal volume get --force `
+  legalqa-results "/private-<id>" ".\outputs\modal\private-<id>"
+```
+
 ## 6. Luồng xử lý tự động trên Modal
 
 Một lệnh `modal run` thực hiện lần lượt:
@@ -359,6 +443,8 @@ Một lệnh `modal run` thực hiện lần lượt:
 10. lưu model, log, manifest và file dự đoán;
 11. tải các output chính về máy nếu terminal vẫn kết nối.
 
+Luồng trên áp dụng cho public inference hoặc lần thiết lập ban đầu. Khi chọn `--dataset private`, workflow xác minh dataset, ba base cache và năm ranker đã sẵn sàng, sau đó chạy thẳng private inference trên H100.
+
 Phân bổ tài nguyên:
 
 | Giai đoạn | Tài nguyên Modal | Công việc |
@@ -370,6 +456,7 @@ Phân bổ tài nguyên:
 | Build cache đặc trưng | H100, 16 CPU, 128 GiB RAM | Retrieval, query embedding và reranker |
 | Train ensemble XGBRanker | 32 CPU, 64 GiB RAM | Assemble feature và huấn luyện năm ranker |
 | Inference public | H100, 16 CPU, 128 GiB RAM | Dense retrieval và cross-encoder |
+| Inference private | H100, 16 CPU, 128 GiB RAM | Tái sử dụng cache/model và sinh file nộp private |
 
 Parent và child cache lưu embedding NumPy `float32`. Cache tạo bằng T4 có thể đọc và sử dụng trên H100. Builder chọn CUDA theo môi trường, không khóa theo tên GPU và tắt TF32 khi tạo embedding.
 
@@ -443,6 +530,18 @@ File dự đoán cho toàn bộ tập public:
 ```text
 submission.json
 ```
+
+Với private inference, thư mục output có dạng:
+
+```text
+outputs/modal/private-<id>/
+├── submission_private.json
+├── inference_log_private.json
+├── run_manifest.json
+└── 03_infer_private.log
+```
+
+`submission_private.json` là file dùng để nộp private test. `inference_log_private.json` chứa số câu đã xử lý và danh sách lỗi nếu có.
 
 Output đồng thời được lưu trên Modal tại:
 
@@ -533,6 +632,32 @@ Trước khi sử dụng file đầu ra, kiểm tra:
 4. không có câu trả lời rỗng;
 5. không nhầm với file `submission_smoke_<n>.json`.
 
+Với private test, chọn đúng `submission_private.json`, không chọn `submission_private_smoke_<n>.json`. Kiểm tra nhanh file private mới nhất bằng PowerShell:
+
+```powershell
+$file = Get-ChildItem .\outputs\modal -Recurse -Filter submission_private.json |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 1
+
+$json = Get-Content -Raw $file.FullName | ConvertFrom-Json
+$rows = @($json.PSObject.Properties)
+$empty = @($rows | Where-Object {
+  [string]::IsNullOrWhiteSpace([string]$_.Value.answer)
+})
+$logFile = Join-Path $file.DirectoryName "inference_log_private.json"
+$log = Get-Content -Raw $logFile | ConvertFrom-Json
+$errors = @($log | Where-Object { $null -ne $_.error })
+
+[pscustomobject]@{
+  File = $file.FullName
+  Questions = $rows.Count
+  EmptyAnswers = $empty.Count
+  Errors = $errors.Count
+}
+```
+
+Với bộ private hiện tại, kết quả hợp lệ phải có `Questions = 1918`, `EmptyAnswers = 0` và `Errors = 0`.
+
 ## 12. Xử lý lỗi thường gặp
 
 ### Modal báo chưa đăng nhập
@@ -552,6 +677,10 @@ Mở tab **Logs**, chọn đúng app và đọc traceback cuối cùng. Log củ
 ### Terminal đóng trước khi tải file
 
 Output vẫn nằm trên `legalqa-results`. Dùng lệnh `modal volume get` tại mục 8.
+
+### Private inference dừng sau khi đã chạy nhiều câu
+
+Không tạo `run_id` mới. Ghi lại `private-<id>` của lần chạy bị dừng, sửa nguyên nhân trong code nếu có traceback, sau đó chạy lại với `--resume-run-id private-<id>` theo mục 5.11. Pipeline sẽ tái sử dụng checkpoint và chỉ xử lý lại câu lỗi hoặc answer rỗng.
 
 ### Hết bộ nhớ GPU
 
