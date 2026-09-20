@@ -6,3 +6,4 @@ outputs/*
 data/cache/*.pkl
 !data/cache/.gitkeep
 data/models/
+data/TASK2/private-official.json

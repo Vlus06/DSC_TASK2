@@ -440,6 +440,41 @@ def canonical_action_sort(df: pd.DataFrame) -> pd.DataFrame:
     return df.sort_values(['qid', 'action_size', 'action_i', 'action_j'], kind='stable').reset_index(drop=True)
 
 
+def action_metadata(candidate_dicts: Sequence[Mapping], ranks: Sequence[int]) -> dict:
+    selected = [candidate_dicts[int(rank) - 1] for rank in ranks]
+    primary = max(selected, key=lambda candidate: float(candidate['ce']))
+    return {
+        'primary_doc': str(primary['doc_id']),
+        'first_article': parse_first_dieu(primary['text']),
+    }
+
+
+def build_action_frame(qid: str, question: str, candidate_dicts: Sequence[Mapping]) -> pd.DataFrame:
+    if len(candidate_dicts) != 5:
+        raise RuntimeError(f'Expected five candidates, got {len(candidate_dicts)}')
+    rows = []
+    for rank, candidate in enumerate(candidate_dicts, start=1):
+        rows.append({
+            'qid': str(qid), 'action_key': f'S{rank}',
+            'action_type': 'single', 'action_size': 1,
+            'action_i': rank, 'action_j': 0,
+            **action_metadata(candidate_dicts, [rank]),
+            **singleton_action_features(question, candidate),
+        })
+    for i, j in itertools.combinations(range(1, 6), 2):
+        rows.append({
+            'qid': str(qid), 'action_key': f'P{i}_{j}',
+            'action_type': 'pair', 'action_size': 2,
+            'action_i': i, 'action_j': j,
+            **action_metadata(candidate_dicts, [i, j]),
+            **pair_features(question, candidate_dicts[i - 1], candidate_dicts[j - 1]),
+        })
+    frame = canonical_action_sort(pd.DataFrame(rows))
+    if len(frame) != 15:
+        raise RuntimeError(f'Expected 15 actions, got {len(frame)}')
+    return frame
+
+
 def make_ranker(cfg: PipelineSettings, random_state: int):
     import xgboost as xgb
     return xgb.XGBRanker(
@@ -825,44 +860,12 @@ class LegalQAEngine:
             targets.append({'rank': rank, 'target': meteor_local(pred, gold), 'answer_len': len(pred)})
         return targets
 
-    def predict(self, question: str, models, qid: str, return_debug: bool = False):
+    def predict(self, question: str, selector, qid: str, return_debug: bool = False):
         top5, ret_dbg = self.retrieve_top5(question)
         cand_dicts = self.candidate_dicts(top5)
-        rows = []
-        for rank, c in enumerate(cand_dicts, start=1):
-            rows.append({
-                'qid': 'PUBLIC', 'action_type': 'single', 'action_size': 1,
-                'action_i': rank, 'action_j': 0,
-                **singleton_action_features(question, c),
-            })
-        for i, j in itertools.combinations(range(5), 2):
-            rows.append({
-                'qid': 'PUBLIC', 'action_type': 'pair', 'action_size': 2,
-                'action_i': i + 1, 'action_j': j + 1,
-                **pair_features(question, cand_dicts[i], cand_dicts[j]),
-            })
-        action_df = canonical_action_sort(pd.DataFrame(rows))
-        assert len(action_df) == 15
-
-        rank_cols = []
-        member_best_rows = []
-        for member, model in enumerate(models):
-            pcol, rcol = f'pred_m{member}', f'rank_m{member}'
-            action_df[pcol] = model.predict(action_df[ACTION_FEATURES])
-            action_df[rcol] = pd.Series(action_df[pcol].to_numpy()).rank(
-                method='first', ascending=False,
-            ).to_numpy(dtype=np.float64)
-            rank_cols.append(rcol)
-            member_best_rows.append(action_df.sort_values(
-                [rcol, 'action_size', 'action_i', 'action_j'],
-                ascending=[True, True, True, True], kind='stable',
-            ).iloc[0])
-        action_df['mean_rank'] = action_df[rank_cols].mean(axis=1)
-        chosen = action_df.sort_values(
-            ['mean_rank', 'action_size', 'action_i', 'action_j'],
-            ascending=[True, True, True, True], kind='stable',
-        ).iloc[0]
-        size, i, j = int(chosen.action_size), int(chosen.action_i), int(chosen.action_j)
+        action_df = build_action_frame(str(qid), question, cand_dicts)
+        selection = selector.select_action(action_df)
+        size, i, j = selection.action_size, selection.action_i, selection.action_j
         if size == 1:
             kept = [top5[i - 1]]
         elif size == 2:
@@ -873,16 +876,16 @@ class LegalQAEngine:
         answer = postprocess_best_06252(raw_answer, question=question, qid=str(qid))
         if not return_debug:
             return answer
-        member_actions = [[int(r.action_size), int(r.action_i), int(r.action_j)] for r in member_best_rows]
-        ensemble_action = [size, i, j]
         return answer, {
             **ret_dbg,
-            'member_actions': member_actions,
-            'ensemble_action': ensemble_action,
-            'ensemble_action_size': size,
-            'ensemble_i': i, 'ensemble_j': j,
-            'selected_singleton': bool(size == 1),
-            'seed_unique_actions': int(len({tuple(x) for x in member_actions})),
-            'ensemble_differs_from_member0': bool(ensemble_action != member_actions[0]),
-            'ensemble_mean_rank': float(chosen.mean_rank),
+            'retarget_action': selection.retarget_action,
+            'baseline_meta_action': selection.baseline_meta_action,
+            'pairwise_action': selection.pairwise_action,
+            'final_action': selection.final_action,
+            'direct_prob': float(selection.direct_prob),
+            'used_pairwise_gate': bool(selection.used_pairwise_gate),
+            'allowed_action_count': int(selection.allowed_action_count),
+            'selected_action_size': size,
+            'selected_i': i,
+            'selected_j': j,
         }

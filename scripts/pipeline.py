@@ -5,28 +5,32 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import os
 import pickle
 import platform
 import sys
 import time
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from legalqa.artifacts import (
-    assemble_training_actions,
     build_or_load_candidate_audit,
     build_or_load_pair_features,
     build_or_load_singleton_features,
     build_or_load_top_documents,
     cache_manifest,
+    load_evaluation_questions,
     load_task2,
     split_training_data,
 )
-from legalqa.engine import ACTION_FEATURES, LegalQAEngine, configure_cuda, ensure_nltk_resources, train_ranker_ensemble
+from legalqa.engine import LegalQAEngine, configure_cuda, ensure_nltk_resources
+from legalqa.model_bundle import load_bundle
+from legalqa.selector_training import train_selector_v21
 from legalqa.settings import PipelineSettings
 from legalqa.text_utils import load_stopwords
 
@@ -45,6 +49,32 @@ def pickle_dump(data, path: Path) -> None:
     with temporary.open("wb") as handle:
         pickle.dump(data, handle, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(temporary, path)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def resolved_hf_revisions(engine) -> dict:
+    """Return resolved Hub commit hashes when model configs expose them."""
+    revisions = {}
+    try:
+        revision = getattr(engine.bi_encoder[0].auto_model.config, "_commit_hash", None)
+        if revision:
+            revisions["bi_encoder"] = revision
+    except Exception:
+        pass
+    try:
+        revision = getattr(engine.cross_encoder.model.config, "_commit_hash", None)
+        if revision:
+            revisions["reranker"] = revision
+    except Exception:
+        pass
+    return revisions
 
 
 def detect_device(requested: str) -> str:
@@ -169,18 +199,6 @@ def prepare_features(cfg, engine, train, split, cache_dir, checkpoint_every):
     return audit, pair_cache, singleton_cache, provenance
 
 
-def train_answer_rankers(cfg, actions, output_dir: Path):
-    print("\n=== TRAIN FIVE ANSWER RANKERS ===", flush=True)
-    started = time.time()
-    models = train_ranker_ensemble(cfg, actions, ACTION_FEATURES)
-    model_dir = output_dir / "models"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    for seed, model in zip(cfg.model_seeds, models):
-        model.save_model(model_dir / f"answer_ranker_seed_{seed}.json")
-    print(f"Five rankers trained in {(time.time() - started) / 60:.1f}m", flush=True)
-    return models
-
-
 def inference_artifact_names(dataset_name: str, full_run: bool, selected_count: int):
     if dataset_name not in {'public', 'private'}:
         raise ValueError(f'Unsupported inference dataset: {dataset_name}')
@@ -201,7 +219,7 @@ def inference_artifact_names(dataset_name: str, full_run: bool, selected_count: 
 def run_public_inference(
     cfg,
     engine,
-    models,
+    selector,
     public,
     output_dir: Path,
     limit: int = 0,
@@ -220,11 +238,17 @@ def run_public_inference(
     submission_path = output_dir / submission_name
     log_path = output_dir / log_name
 
+    selector_signature = getattr(selector, "bundle_signature", None)
+    if not isinstance(selector_signature, str):
+        selector_signature = "test-or-unversioned"
     predictions, inference_log = {}, []
     if progress_path.exists():
         with progress_path.open("rb") as handle:
             progress = pickle.load(handle)
-        if progress.get("version") == "legalqa_inference_progress_v1":
+        if (
+            progress.get("version") == "legalqa_inference_progress_selector_v21_v1"
+            and progress.get("selector_signature") == selector_signature
+        ):
             predictions = {str(key): value for key, value in progress.get("predictions", {}).items()}
             inference_log = progress.get("inference_log", [])
             retry_qids = {
@@ -264,7 +288,8 @@ def run_public_inference(
     def save_progress() -> None:
         pickle_dump(
             {
-                "version": "legalqa_inference_progress_v1",
+                "version": "legalqa_inference_progress_selector_v21_v1",
+                "selector_signature": selector_signature,
                 "predictions": predictions,
                 "inference_log": inference_log,
             },
@@ -278,7 +303,7 @@ def run_public_inference(
         try:
             prediction, debug = engine.predict(
                 item["question"],
-                models,
+                selector,
                 qid=qid,
                 return_debug=True,
             )
@@ -317,6 +342,8 @@ def run_public_inference(
     expected = len(selected_public)
     if len(predictions) != expected:
         raise RuntimeError(f"Prediction count {len(predictions)} != expected {expected}")
+    if set(predictions) != allowed:
+        raise RuntimeError("Submission qid set does not exactly match the selected evaluation set")
 
     json_dump(predictions, submission_path)
     json_dump(inference_log, log_path)
@@ -331,15 +358,52 @@ def run_public_inference(
             f"Output guard failed: rows={expected}, empty={empty_count}, errors={error_count}; "
             f"inspect {log_path}"
         )
-    print(f"READY: {submission_path}", flush=True)
+    zip_path = submission_path.with_suffix(".zip")
+    temporary_zip = zip_path.with_name(zip_path.name + ".tmp")
+    with zipfile.ZipFile(temporary_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.write(submission_path, arcname="submission.json")
+    os.replace(temporary_zip, zip_path)
+    with zipfile.ZipFile(zip_path) as archive:
+        if archive.namelist() != ["submission.json"]:
+            raise RuntimeError("Submission ZIP must contain only submission.json")
+    print(f"READY: {submission_path}\nREADY ZIP: {zip_path}", flush=True)
     return submission_path, log_path
+
+
+def load_complete_feature_caches(cfg, cache_dir: Path, scale_qids: list[str]):
+    with (cache_dir / cfg.pair_features_cache_name).open("rb") as handle:
+        pair_cache = pickle.load(handle)
+    with (cache_dir / cfg.singleton_features_cache_name).open("rb") as handle:
+        singleton_cache = pickle.load(handle)
+    expected = set(map(str, scale_qids))
+    pair_qids = set(map(str, pair_cache.get("rows_by_qid", {})))
+    singleton_qids = set(map(str, singleton_cache.get("items_by_qid", {})))
+    if not expected <= pair_qids or not expected <= singleton_qids:
+        raise RuntimeError("Feature caches do not contain all frozen SCALE5000 qids")
+    return pair_cache, singleton_cache
+
+
+def lightweight_engine(cfg, cache_dir, passages, names, links, stopwords):
+    engine = LegalQAEngine.__new__(LegalQAEngine)
+    engine.cfg = cfg
+    engine.cache_dir = Path(cache_dir)
+    engine.doc_id_to_passage = dict(passages)
+    engine.doc_id_to_name = dict(names)
+    engine.doc_id_to_link = dict(links)
+    engine.stopwords = stopwords
+    engine.device = "cpu"
+    engine.ce_batch_size = cfg.ce_batch_size
+    engine.query_cache = {}
+    engine.bi_encoder = None
+    engine.cross_encoder = None
+    return engine
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="LegalQA Task 2 pipeline")
     parser.add_argument(
         "--mode",
-        choices=["check", "prepare", "infer"],
+        choices=["check", "prepare", "train-selector-v21", "infer"],
         default="infer",
     )
     parser.add_argument("--task2-dir", type=Path, default=ROOT / "data" / "TASK2")
@@ -350,17 +414,26 @@ def main() -> None:
     parser.add_argument("--ce-batch-size", type=int, default=32)
     parser.add_argument("--checkpoint-every", type=int, default=25)
     parser.add_argument("--public-limit", type=int, default=0)
+    parser.add_argument("--private-limit", type=int, default=0)
+    parser.add_argument("--split", choices=["public", "private"], default="public")
+    parser.add_argument(
+        "--model-dir", type=Path,
+        default=ROOT / "data" / "models" / "legalqa_selector_v21",
+    )
     args = parser.parse_args()
 
     if args.ce_batch_size <= 0 or args.checkpoint_every <= 0:
         parser.error("Batch size and checkpoint interval must be positive")
-    if not 0 <= args.public_limit <= 1000:
-        parser.error("--public-limit must be in 0..1000")
+    if args.public_limit < 0 or args.private_limit < 0:
+        parser.error("Inference limits must be non-negative")
 
     cfg = PipelineSettings(ce_batch_size=args.ce_batch_size)
     args.cache_dir.mkdir(parents=True, exist_ok=True)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    base_cache_paths = validate_base_cache_files(cfg, args.cache_dir)
+    base_cache_paths = (
+        {} if args.mode == "train-selector-v21"
+        else validate_base_cache_files(cfg, args.cache_dir)
+    )
 
     device = detect_device(args.device)
     configure_cuda(cfg.seed)
@@ -369,19 +442,6 @@ def main() -> None:
     train = {str(key): value for key, value in train.items()}
     public = {str(key): value for key, value in public.items()}
     stopwords = load_stopwords(args.stopwords)
-
-    engine = LegalQAEngine(
-        cfg,
-        args.cache_dir,
-        passages,
-        names,
-        links,
-        stopwords,
-        device=device,
-        ce_batch_size=args.ce_batch_size,
-        load_models=args.mode != "check",
-    )
-    print("Base cache validation PASS.", flush=True)
 
     split = split_training_data(train, cfg.seed)
     base1000, holdout1000, training5000 = split
@@ -402,49 +462,72 @@ def main() -> None:
     }
 
     if args.mode == "check":
+        LegalQAEngine(
+            cfg, args.cache_dir, passages, names, links, stopwords,
+            device=device, ce_batch_size=args.ce_batch_size, load_models=False,
+        )
         json_dump(manifest, args.output_dir / "environment_report.json")
         print("CHECK PASS", flush=True)
         return
 
-    audit, pair_cache, singleton_cache, provenance = prepare_features(
-        cfg,
-        engine,
-        train,
-        split,
-        args.cache_dir,
-        args.checkpoint_every,
-    )
-    manifest["feature_cache_provenance"] = provenance
     if args.mode == "prepare":
+        engine = LegalQAEngine(
+            cfg, args.cache_dir, passages, names, links, stopwords,
+            device=device, ce_batch_size=args.ce_batch_size, load_models=True,
+        )
+        _audit, _pair, _single, provenance = prepare_features(
+            cfg, engine, train, split, args.cache_dir, args.checkpoint_every,
+        )
+        manifest["feature_cache_provenance"] = provenance
         json_dump(manifest, args.output_dir / "run_manifest.json")
         print("PREPARE PASS", flush=True)
         return
 
-    assembled = assemble_training_actions(
-        cfg,
-        engine,
-        train,
-        base1000,
-        holdout1000,
-        training5000,
-        audit,
-        pair_cache,
-        singleton_cache,
+    if args.mode == "train-selector-v21":
+        pair_cache, singleton_cache = load_complete_feature_caches(
+            cfg, args.cache_dir, training5000,
+        )
+        engine = lightweight_engine(
+            cfg, args.cache_dir, passages, names, links, stopwords,
+        )
+        selector_manifest = train_selector_v21(
+            engine, train, training5000, pair_cache, singleton_cache,
+            args.cache_dir, args.model_dir,
+            checkpoint_every=args.checkpoint_every,
+        )
+        manifest["selector_bundle"] = selector_manifest
+        json_dump(manifest, args.output_dir / "run_manifest.json")
+        print("TRAIN SELECTOR V2.1 PASS", flush=True)
+        return
+
+    evaluation = public if args.split == "public" else load_evaluation_questions(
+        args.task2_dir, "private",
     )
-    actions = assembled["actions"]
-    models = train_answer_rankers(cfg, actions, args.output_dir)
+    evaluation = {str(key): value for key, value in evaluation.items()}
+    selector, selector_manifest = load_bundle(args.model_dir, verify_hashes=True)
+    engine = LegalQAEngine(
+        cfg, args.cache_dir, passages, names, links, stopwords,
+        device=device, ce_batch_size=args.ce_batch_size, load_models=True,
+    )
+    inference_limit = args.public_limit if args.split == "public" else args.private_limit
     submission, inference_log = run_public_inference(
         cfg,
         engine,
-        models,
-        public,
+        selector,
+        evaluation,
         args.output_dir,
-        limit=args.public_limit,
+        limit=inference_limit,
         checkpoint_every=args.checkpoint_every,
+        dataset_name=args.split,
     )
     manifest["submission"] = str(submission)
+    manifest["submission_zip"] = str(submission.with_suffix(".zip"))
+    manifest["submission_zip_sha256"] = sha256_file(submission.with_suffix(".zip"))
     manifest["inference_log"] = str(inference_log)
-    manifest["public_limit"] = int(args.public_limit)
+    manifest["dataset"] = args.split
+    manifest["inference_limit"] = int(inference_limit)
+    manifest["selector_bundle_version"] = selector_manifest["version"]
+    manifest["huggingface_revisions"] = resolved_hf_revisions(engine)
     json_dump(manifest, args.output_dir / "run_manifest.json")
 
 

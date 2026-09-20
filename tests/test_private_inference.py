@@ -3,6 +3,7 @@ import pickle
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -75,7 +76,8 @@ class PrivateInferenceTests(unittest.TestCase):
             with progress.open("wb") as handle:
                 pickle.dump(
                     {
-                        "version": "legalqa_inference_progress_v1",
+                        "version": "legalqa_inference_progress_selector_v21_v1",
+                        "selector_signature": "test-or-unversioned",
                         "predictions": {
                             "ok": {"answer": "existing"},
                             "retry": {"answer": ""},
@@ -117,6 +119,8 @@ class PrivateInferenceTests(unittest.TestCase):
                 checkpoint_every=1,
             )
             predictions = json.loads(submission.read_text(encoding="utf-8"))
+            with zipfile.ZipFile(submission.with_suffix(".zip")) as archive:
+                self.assertEqual(archive.namelist(), ["submission.json"])
 
             engine.predict.assert_called_once_with(
                 "retry me", [], qid="retry", return_debug=True,

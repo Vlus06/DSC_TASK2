@@ -15,6 +15,7 @@ APP_DATA = Path("/app/data")
 REMOTE_CACHE = APP_DATA / "cache"
 REMOTE_RESULTS = Path("/results")
 REMOTE_MODELS = Path("/models/legalqa")
+REMOTE_SELECTOR = REMOTE_MODELS / "legalqa_selector_v21"
 
 app = modal.App("legalqa-pipeline")
 data_volume = modal.Volume.from_name("legalqa-data", create_if_missing=True)
@@ -25,6 +26,7 @@ cpu_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
         "numpy>=1.26,<3", "pandas>=2.2,<3", "xgboost==3.2.0",
+        "lightgbm==4.6.0", "catboost==1.2.10", "scikit-learn>=1.5,<2",
         "rank-bm25==0.2.2", "underthesea>=6.8,<9", "nltk>=3.9,<4",
     )
     .env({"PYTHONUNBUFFERED": "1", "NLTK_DATA": "/models/nltk"})
@@ -61,8 +63,16 @@ FEATURE_CACHE_NAMES = {
 }
 PACKED_CORPUS_NAME = "corpus_metadata.pkl"
 FEATURE_MARKER_NAME = "feature_cache_complete.json"
-MODEL_NAMES = [f"answer_ranker_seed_{seed}.json" for seed in (42, 10042, 20042, 30042, 40042)]
-MODEL_MANIFEST_NAME = "training_manifest.json"
+SELECTOR_FILES = [
+    *[f"retarget_{seed}.json" for seed in (42, 10042, 20042, 30042, 40042)],
+    "heterogeneous_xgb_pair_s1.json", "heterogeneous_lgb_rank_s1.txt",
+    "heterogeneous_cat_yeti_s1.cbm", "heterogeneous_xgb_pair_s2.json",
+    "heterogeneous_xgb_ndcg.json", "heterogeneous_lgb_deep.txt",
+    "heterogeneous_cat_pair.cbm", "heterogeneous_xgb_reg.json",
+    "heterogeneous_lgb_reg.txt", "heterogeneous_cat_reg.cbm",
+    "xgb_rank_meta.json", "pairwise_regret_v2.json",
+]
+SELECTOR_MANIFEST_NAME = "selector_manifest.json"
 
 
 def _has_file(directory: Path, names: tuple[str, ...]) -> bool:
@@ -113,23 +123,24 @@ def inspect_inputs() -> dict:
         key: _has_file(REMOTE_CACHE, (name,))
         for key, name in FEATURE_CACHE_NAMES.items()
     }
-    models = {
-        name: (REMOTE_MODELS / name).is_file() and (REMOTE_MODELS / name).stat().st_size > 0
-        for name in MODEL_NAMES
+    selector_files = {
+        name: (REMOTE_SELECTOR / name).is_file() and (REMOTE_SELECTOR / name).stat().st_size > 0
+        for name in SELECTOR_FILES
     }
-    model_manifest_ready = False
-    model_manifest_path = REMOTE_MODELS / MODEL_MANIFEST_NAME
+    selector_manifest_ready = False
+    model_manifest_path = REMOTE_SELECTOR / SELECTOR_MANIFEST_NAME
     if model_manifest_path.is_file() and model_manifest_path.stat().st_size > 0:
         try:
             manifest = json.loads(model_manifest_path.read_text(encoding="utf-8"))
-            model_manifest_ready = (
-                manifest.get("version") == "legalqa_ranker_ensemble_v1"
-                and manifest.get("rows") == 105000
-                and manifest.get("qids") == 7000
-                and manifest.get("seeds") == [42, 10042, 20042, 30042, 40042]
+            selector_manifest_ready = (
+                manifest.get("version") == "legalqa_selector_v21_gate055_06299_v1"
+                and manifest.get("training_qid_count") == 5000
+                and manifest.get("oof_rows") == 75000
+                and manifest.get("model_count") == 17
+                and manifest.get("gate_threshold") == 0.55
             )
         except (OSError, TypeError, ValueError):
-            model_manifest_ready = False
+            selector_manifest_ready = False
     state = {
         "dataset_ready": dataset_ready,
         "private_ready": private.is_file() and private.stat().st_size > 0,
@@ -138,8 +149,9 @@ def inspect_inputs() -> dict:
         "base": base,
         "feature_caches": feature_caches,
         "feature_marker": _has_file(REMOTE_CACHE, (FEATURE_MARKER_NAME,)),
-        "models": models,
-        "model_manifest": model_manifest_ready,
+        "selector_files": selector_files,
+        "selector_manifest": selector_manifest_ready,
+        "selector_ready": all(selector_files.values()) and selector_manifest_ready,
     }
     print(json.dumps(state, ensure_ascii=False, indent=2), flush=True)
     return state
@@ -260,7 +272,7 @@ def prepare_features(run_id: str, ce_batch_size: int) -> None:
     image=cpu_image, volumes=ALL_VOLUMES, cpu=32, memory=65536,
     timeout=24 * 3600, scaledown_window=30,
 )
-def train_rankers(run_id: str) -> None:
+def train_selector_v21(run_id: str) -> None:
     for volume in (data_volume, results_volume, models_volume):
         volume.reload()
     out = REMOTE_RESULTS / run_id
@@ -268,12 +280,13 @@ def train_rankers(run_id: str) -> None:
     try:
         _stream(
             [
-                sys.executable, "-u", "/app/scripts/modal_stages.py", "train",
+                sys.executable, "-u", "/app/scripts/modal_stages.py", "train-selector-v21",
                 "--run-dir", str(out),
             ],
-            out / "02_train_rankers.log",
+            out / "02_train_selector_v21.log",
         )
     finally:
+        data_volume.commit()
         results_volume.commit()
         models_volume.commit()
 
@@ -357,12 +370,12 @@ def workflow(run_id: str, ce_batch_size: int, public_limit: int, checkpoint_ever
     else:
         print("[workflow] four feature caches found -> reuse", flush=True)
 
-    models_ready = all(state["models"].values()) and state["model_manifest"]
-    if models_ready and not features_rebuilt:
-        print("[workflow] five trained rankers found -> reuse", flush=True)
+    state = inspect_inputs.remote()
+    if state["selector_ready"] and not features_rebuilt:
+        print("[workflow] complete selector V2.1 bundle found -> reuse", flush=True)
     else:
-        print("[workflow] trained rankers missing/stale -> CPU train", flush=True)
-        train_rankers.remote(run_id)
+        print("[workflow] selector V2.1 bundle missing/stale -> CPU train", flush=True)
+        train_selector_v21.remote(run_id)
     print("[workflow] public inference -> H100", flush=True)
     infer_public.remote(run_id, public_limit, checkpoint_every, ce_batch_size)
     print(f"[workflow] DONE: /results/{run_id}", flush=True)
@@ -403,9 +416,10 @@ def _download_outputs(run_id: str, public_limit: int) -> Path:
     destination = ROOT / "outputs/modal" / run_id
     destination.mkdir(parents=True, exist_ok=True)
     names = [
-        "01_prepare_features.log", "02_train_rankers.log", "03_infer_public.log",
-        "training_manifest.json", "run_manifest.json",
+        "01_prepare_features.log", "02_train_selector_v21.log", "03_infer_public.log",
+        "selector_manifest.json", "run_manifest.json",
         (f"submission_smoke_{public_limit}.json" if public_limit else "submission.json"),
+        (f"submission_smoke_{public_limit}.zip" if public_limit else "submission.zip"),
         (f"inference_log_smoke_{public_limit}.json" if public_limit else "inference_log.json"),
     ]
     for name in names:
@@ -425,6 +439,10 @@ def _download_private_outputs(run_id: str, private_limit: int) -> Path:
         (
             f"submission_private_smoke_{private_limit}.json"
             if private_limit else "submission_private.json"
+        ),
+        (
+            f"submission_private_smoke_{private_limit}.zip"
+            if private_limit else "submission_private.zip"
         ),
         (
             f"inference_log_private_smoke_{private_limit}.json"
@@ -467,8 +485,8 @@ def main(
             raise RuntimeError("private-official.json is missing on legalqa-data")
         if not all(state["base"].values()):
             raise RuntimeError(f"Base cache is incomplete: {state['base']}")
-        if not all(state["models"].values()) or not state["model_manifest"]:
-            raise RuntimeError("Trained rankers are missing or invalid")
+        if not state["selector_ready"]:
+            raise RuntimeError("Frozen selector V2.1 bundle is missing or invalid")
         run_id = resume_run_id.strip() or f"private-{uuid.uuid4().hex}"
         print(f"Starting private inference; Run ID: {run_id}", flush=True)
         infer_private.remote(run_id, private_limit, checkpoint_every, ce_batch_size)

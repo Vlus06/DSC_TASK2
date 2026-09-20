@@ -9,7 +9,6 @@ import os
 import pickle
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,7 +17,7 @@ sys.path.insert(0, str(ROOT / "src"))
 DATA = ROOT / "data"
 CACHE = DATA / "cache"
 TASK2 = DATA / "TASK2"
-MODEL_ROOT = Path("/models/legalqa")
+MODEL_ROOT = Path("/models/legalqa/legalqa_selector_v21")
 
 
 def run_command(command: list[str]) -> None:
@@ -175,65 +174,29 @@ def load_context(*, load_models: bool, ce_batch_size: int = 32, evaluation_split
     return cfg, train, evaluation, engine, split_training_data(train, cfg.seed)
 
 
-def train_rankers(run_dir: Path) -> None:
-    from legalqa.artifacts import assemble_training_actions
-    from legalqa.engine import ACTION_FEATURES, train_ranker_ensemble
+def train_selector(run_dir: Path, checkpoint_every: int) -> None:
+    from legalqa.selector_training import train_selector_v21
 
     cfg, train, _public, engine, split = load_context(load_models=False)
-    base1000, holdout1000, training5000 = split
-    audit, pair, single = load_complete_features(cfg, *split)
-
-    print("[train] assembling ranking actions for 7,000 labeled questions", flush=True)
-    assembled = assemble_training_actions(
-        cfg,
-        engine,
-        train,
-        base1000,
-        holdout1000,
-        training5000,
-        audit,
-        pair,
-        single,
-    )
-    actions = assembled["actions"]
-    print(f"[train] fitting five rankers on {len(actions)} actions (CPU)", flush=True)
-    started = time.time()
-    models = train_ranker_ensemble(cfg, actions, ACTION_FEATURES)
-
-    MODEL_ROOT.mkdir(parents=True, exist_ok=True)
-    for seed, model in zip(cfg.model_seeds, models):
-        model.save_model(MODEL_ROOT / f"answer_ranker_seed_{seed}.json")
-    manifest = {
-        "version": "legalqa_ranker_ensemble_v1",
-        "rows": len(actions),
-        "qids": int(actions.qid.nunique()),
-        "seeds": list(cfg.model_seeds),
-        "seconds": time.time() - started,
-    }
-    (MODEL_ROOT / "training_manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    _base1000, _holdout1000, training5000 = split
+    _audit, pair, single = load_complete_features(cfg, *split)
+    manifest = train_selector_v21(
+        engine, train, training5000, pair, single, CACHE, MODEL_ROOT,
+        checkpoint_every=checkpoint_every,
     )
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "training_manifest.json").write_text(
+    (run_dir / "selector_manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    print("[train] five rankers saved", flush=True)
+    print("[train] frozen selector V2.1 bundle ready", flush=True)
 
 
-def load_rankers(cfg):
-    from xgboost import XGBRanker
+def load_selector():
+    from legalqa.model_bundle import load_bundle
 
-    models = []
-    for seed in cfg.model_seeds:
-        path = MODEL_ROOT / f"answer_ranker_seed_{seed}.json"
-        if not path.is_file():
-            raise FileNotFoundError(f"Missing trained ranker: {path}")
-        model = XGBRanker()
-        model.load_model(path)
-        models.append(model)
-    print(f"[infer] loaded {len(models)} XGBoost rankers", flush=True)
-    return models
-
+    selector, manifest = load_bundle(MODEL_ROOT, verify_hashes=True)
+    print(f"[infer] loaded frozen selector {manifest['version']}", flush=True)
+    return selector, manifest
 
 def infer_public(
     run_dir: Path,
@@ -241,29 +204,32 @@ def infer_public(
     checkpoint_every: int,
     ce_batch_size: int,
 ) -> None:
-    from pipeline import run_public_inference
+    from pipeline import resolved_hf_revisions, run_public_inference, sha256_file
 
     cfg, _train, public, engine, _split = load_context(
         load_models=True,
         ce_batch_size=ce_batch_size,
     )
-    models = load_rankers(cfg)
+    selector, selector_manifest = load_selector()
     submission, inference_log = run_public_inference(
         cfg,
         engine,
-        models,
+        selector,
         public,
         run_dir,
         limit=public_limit,
         checkpoint_every=checkpoint_every,
     )
     manifest = {
-        "version": "legalqa_modal_run_v1",
+        "version": "legalqa_modal_selector_v21_run_v1",
         "public_limit": public_limit,
         "submission": submission.name,
+        "submission_zip": submission.with_suffix(".zip").name,
+        "submission_zip_sha256": sha256_file(submission.with_suffix(".zip")),
         "inference_log": inference_log.name,
         "ce_batch_size": ce_batch_size,
-        "model_seeds": list(cfg.model_seeds),
+        "selector_bundle_version": selector_manifest["version"],
+        "huggingface_revisions": resolved_hf_revisions(engine),
     }
     (run_dir / "run_manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -277,18 +243,18 @@ def infer_private(
     checkpoint_every: int,
     ce_batch_size: int,
 ) -> None:
-    from pipeline import run_public_inference
+    from pipeline import resolved_hf_revisions, run_public_inference, sha256_file
 
     cfg, _train, private, engine, _split = load_context(
         load_models=True,
         ce_batch_size=ce_batch_size,
         evaluation_split="private",
     )
-    models = load_rankers(cfg)
+    selector, selector_manifest = load_selector()
     submission, inference_log = run_public_inference(
         cfg,
         engine,
-        models,
+        selector,
         private,
         run_dir,
         limit=private_limit,
@@ -296,13 +262,16 @@ def infer_private(
         dataset_name="private",
     )
     manifest = {
-        "version": "legalqa_modal_run_v1",
+        "version": "legalqa_modal_selector_v21_run_v1",
         "dataset": "private",
         "private_limit": private_limit,
         "submission": submission.name,
+        "submission_zip": submission.with_suffix(".zip").name,
+        "submission_zip_sha256": sha256_file(submission.with_suffix(".zip")),
         "inference_log": inference_log.name,
         "ce_batch_size": ce_batch_size,
-        "model_seeds": list(cfg.model_seeds),
+        "selector_bundle_version": selector_manifest["version"],
+        "huggingface_revisions": resolved_hf_revisions(engine),
     }
     (run_dir / "run_manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -316,7 +285,7 @@ def main() -> None:
         "stage",
         choices=[
             "pack-corpus", "build-bm25", "build-dense", "build-child",
-            "train", "infer", "infer-private",
+            "train-selector-v21", "infer", "infer-private",
         ],
     )
     parser.add_argument("--run-dir", type=Path, default=Path("/results/manual"))
@@ -331,8 +300,8 @@ def main() -> None:
         pack_corpus()
     elif args.stage.startswith("build-"):
         build_base(args.stage.removeprefix("build-"), args.batch_size)
-    elif args.stage == "train":
-        train_rankers(args.run_dir)
+    elif args.stage == "train-selector-v21":
+        train_selector(args.run_dir, args.checkpoint_every)
     elif args.stage == "infer":
         infer_public(
             args.run_dir,

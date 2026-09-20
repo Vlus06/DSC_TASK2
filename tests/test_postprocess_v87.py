@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from legalqa.engine import LegalQAEngine
+from legalqa.meta_selector import SelectionResult
 from legalqa.postprocess_v87 import (
     postprocess_best_06252,
     postprocess_qh_complete_safe,
@@ -35,9 +36,14 @@ def _candidate_tuple(rank: int) -> tuple:
     )
 
 
-class _ConstantRanker:
-    def predict(self, rows):
-        return np.zeros(len(rows), dtype=np.float64)
+class _FirstActionSelector:
+    def select_action(self, _rows):
+        return SelectionResult(
+            retarget_action="S1", baseline_meta_action="S1",
+            pairwise_action="S1", final_action="S1", direct_prob=1.0,
+            used_pairwise_gate=False, allowed_action_count=1,
+            action_size=1, action_i=1, action_j=0,
+        )
 
 
 class V87PostprocessTests(unittest.TestCase):
@@ -103,13 +109,13 @@ class V87PostprocessTests(unittest.TestCase):
         engine.retrieve_top5 = Mock(return_value=(top5, {"top_docs": ["1", "2", "3"]}))
         engine.candidate_dicts = Mock(return_value=candidates)
         engine.build_answer = Mock(return_value="RAW ANSWER")
-        models = [_ConstantRanker() for _ in range(5)]
+        selector = _FirstActionSelector()
 
         with patch(
             "legalqa.engine.postprocess_best_06252",
             return_value="0.6252 ANSWER",
         ) as postprocess:
-            answer = engine.predict("Câu hỏi?", models, qid="6323")
+            answer = engine.predict("Câu hỏi?", selector, qid="6323")
 
         self.assertEqual(answer, "0.6252 ANSWER")
         engine.build_answer.assert_called_once_with("Câu hỏi?", [top5[0]])
