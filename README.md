@@ -168,57 +168,191 @@ Mỗi model có kích thước và SHA256 trong manifest. Inference kiểm tra s
 
 ## Chạy trên Modal
 
-Đăng nhập và tạo ba Volume một lần:
+Có hai cách chuẩn bị pipeline:
+
+1. **Dùng cache dựng sẵn từ Google Drive:** nhanh nhất, bỏ qua các bước quét corpus, BM25 và sinh embedding parent/child.
+2. **Chạy lại từ đầu:** bắt đầu từ dataset gốc, lần lượt tạo toàn bộ cache, train selector rồi inference private.
+
+Cả hai cách đều kết thúc bằng `submission_private.zip`. File ZIP dùng để nộp chỉ chứa một file `submission.json`.
+
+### Thiết lập chung
+
+Clone hoặc cập nhật repository:
 
 ```powershell
+git clone https://github.com/Vlus06/DSC_TASK2.git
+cd DSC_TASK2
+```
+
+Nếu đã clone trước đó:
+
+```powershell
+git pull origin main
+```
+
+Tạo môi trường và cài Modal CLI:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install modal
 .\.venv\Scripts\python.exe -m modal setup
+$env:PYTHONIOENCODING = "utf-8"
+```
+
+Tạo ba Volume. Nếu Volume đã tồn tại, Modal sẽ báo và có thể tiếp tục:
+
+```powershell
 .\.venv\Scripts\python.exe -m modal volume create legalqa-data
 .\.venv\Scripts\python.exe -m modal volume create legalqa-models
 .\.venv\Scripts\python.exe -m modal volume create legalqa-results
 ```
 
-Nạp dataset, stopwords và cache có sẵn:
+Vai trò của từng Volume:
 
-```powershell
-.\.venv\Scripts\python.exe -m modal volume put --force legalqa-data .\data\TASK2 /TASK2
-.\.venv\Scripts\python.exe -m modal volume put --force legalqa-data .\data\stopwords.txt /stopwords.txt
-.\.venv\Scripts\python.exe -m modal volume put --force legalqa-data .\data\cache /cache
+| Volume | Nội dung |
+|---|---|
+| `legalqa-data` | Dataset, stopwords, base cache, feature cache, final-target cache và OOF cache |
+| `legalqa-models` | Hugging Face cache và bundle selector V2.1 gồm 17 model |
+| `legalqa-results` | Log, checkpoint inference và submission theo `run_id` |
+
+### Cách 1 — Dùng cache từ Google Drive
+
+#### Bước 1: tải cache
+
+Tải các file trong [Google Drive — DSC_TASK2_2026](https://drive.google.com/drive/folders/137SYXPgpX82kn1-DZIrFGeZwQkk72cDY), rồi đặt vào `data/cache/`.
+
+Kiểm tra đúng tám tên file sau:
+
+```text
+data/cache/
+├── corpus_metadata.pkl
+├── bm25_index.pkl
+├── parent_embeddings.pkl
+├── child_embeddings.pkl
+├── top_documents.pkl
+├── candidate_audit.pkl
+├── pair_features.pkl
+└── singleton_features.pkl
 ```
 
-Nếu chưa có `corpus_metadata.pkl`, tạo bằng CPU:
+Nếu file tải về có tên `parent_embeddings` hoặc `child_embeddings` nhưng không có đuôi, hãy bật **File name extensions** trong Windows Explorer và đổi thành `parent_embeddings.pkl` hoặc `child_embeddings.pkl`. Không đổi các tên khác.
 
-```powershell
-.\.venv\Scripts\python.exe -m modal run .\modal_app.py::pack_corpus
+Bộ cache phải được dùng cùng dataset đã tạo ra nó. Training V2.1 kiểm tra version, qid, action schema, candidate text, score, raw target và SHA256 protocol; cache không tương thích sẽ bị từ chối thay vì âm thầm dùng tiếp.
+
+#### Bước 2: chuẩn bị dataset local
+
+Đặt dữ liệu theo cấu trúc:
+
+```text
+data/
+├── TASK2/
+│   ├── train.json
+│   ├── public-official.json
+│   ├── private-official.json
+│   └── selected-contexts/
+│       └── selected-contexts/
+│           ├── context_....json
+│           └── ...
+├── cache/
+│   └── tám file cache ở bước 1
+└── stopwords.txt
 ```
 
-Kiểm tra trạng thái:
+`private-official.json` được `.gitignore` loại trừ và không được đưa lên GitHub.
+
+#### Bước 3: upload dataset, stopwords và cache
+
+```powershell
+.\.venv\Scripts\python.exe -m modal volume put --force `
+  legalqa-data .\data\TASK2 /TASK2
+
+.\.venv\Scripts\python.exe -m modal volume put --force `
+  legalqa-data .\data\stopwords.txt /stopwords.txt
+
+.\.venv\Scripts\python.exe -m modal volume put --force `
+  legalqa-data .\data\cache /cache
+```
+
+#### Bước 4: kiểm tra cache trên Modal
 
 ```powershell
 .\.venv\Scripts\python.exe -m modal run .\modal_app.py::inspect_inputs
 ```
 
-Nếu bốn feature cache đã có nhưng chưa có bundle V2.1, train riêng trên CPU 32 cores:
+Trước khi train, cần thấy:
+
+```text
+dataset_ready: true
+private_ready: true
+stopwords_ready: true
+packed_corpus: true
+base.bm25: true
+base.dense: true
+base.child: true
+feature_caches.top_documents: true
+feature_caches.candidate_audit: true
+feature_caches.pair_features: true
+feature_caches.singleton_features: true
+```
+
+`selector_ready: false` là trạng thái bình thường nếu chưa train bundle V2.1. `feature_marker` không bắt buộc đối với lệnh train trực tiếp; nội dung cache vẫn được kiểm tra trước khi sử dụng.
+
+Nếu một cache hiển thị `false`, kiểm tra tên và vị trí:
+
+```powershell
+.\.venv\Scripts\python.exe -m modal volume ls legalqa-data /cache
+```
+
+#### Bước 5: train selector V2.1
 
 ```powershell
 .\.venv\Scripts\python.exe -m modal run .\modal_app.py::train_selector_v21 `
   --run-id selector-v21-train
 ```
 
-Final-target và OOF cache được giữ trên `legalqa-data:/cache`. Bundle được giữ tại:
+Stage CPU này thực hiện:
 
-```text
-legalqa-models:/legalqa/legalqa_selector_v21/
-```
+1. tái lập raw target trên mẫu cache lịch sử;
+2. tạo `5.000 × 15 = 75.000` final targets sau `postprocess_best_06252`;
+3. train và dự đoán 5 fold OOF, mỗi fold train trên 4.000 qid và dự đoán 1.000 qid;
+4. ghép đủ 75.000 OOF rows;
+5. train `xgb_rank_meta` và `pairwise_regret_v2`;
+6. train 5 retarget + 10 heterogeneous models trên toàn bộ `scale5000`;
+7. lưu bundle 17 model cùng manifest và SHA256.
 
-Tải bundle về để backup:
+Target cache và mỗi fold OOF được lưu trên `legalqa-data:/cache`. Nếu stage bị dừng, chạy lại đúng lệnh trên; phần hoàn chỉnh có chữ ký khớp sẽ được dùng lại.
+
+Theo dõi log trực tiếp trong terminal hoặc Modal Dashboard. Không bắt đầu private inference cho tới khi stage train kết thúc.
+
+#### Bước 6: xác nhận bundle
 
 ```powershell
-.\.venv\Scripts\python.exe -m modal volume get --force `
-  legalqa-models /legalqa/legalqa_selector_v21 .\data\models\legalqa_selector_v21
+.\.venv\Scripts\python.exe -m modal run .\modal_app.py::inspect_inputs
 ```
 
-Chạy private inference bằng H100 từ bundle đã train:
+Cần thấy:
+
+```text
+selector_manifest: true
+selector_ready: true
+```
+
+Toàn bộ 17 mục trong `selector_files` phải là `true`.
+
+#### Bước 7: smoke test private
+
+```powershell
+.\.venv\Scripts\python.exe -m modal run .\modal_app.py `
+  --dataset private `
+  --private-limit 10 `
+  --ce-batch-size 32 `
+  --checkpoint-every 5
+```
+
+Smoke test tạo `submission_private_smoke_10.zip`; file này chỉ dùng để kiểm tra môi trường.
+
+#### Bước 8: chạy toàn bộ private test
 
 ```powershell
 .\.venv\Scripts\python.exe -m modal run .\modal_app.py `
@@ -228,28 +362,204 @@ Chạy private inference bằng H100 từ bundle đã train:
   --checkpoint-every 25
 ```
 
-Smoke test 10 câu dùng `--private-limit 10`. Khi chạy full, file nộp được tải về:
+`--private-limit 0` chạy toàn bộ tập private. Terminal sẽ in `Run ID` dạng `private-<id>` và tự tải output về:
 
 ```text
-outputs/modal/private-<run_id>/submission_private.zip
+outputs/modal/private-<id>/submission_private.zip
 ```
 
-ZIP chỉ chứa một file có tên `submission.json`. JSON rời và inference log cũng được lưu cùng thư mục. Nếu terminal bị ngắt, dùng lại run id:
+### Cách 2 — Chạy lại hoàn toàn từ đầu
+
+Cách này chỉ cần dataset gốc và `stopwords.txt`. Không đặt các file `.pkl` tải từ Drive vào `data/cache/`.
+
+#### Bước 1: chuẩn bị và upload dữ liệu gốc
+
+Chuẩn bị:
+
+```text
+data/TASK2/train.json
+data/TASK2/public-official.json
+data/TASK2/private-official.json
+data/TASK2/selected-contexts/selected-contexts/*.json
+data/stopwords.txt
+```
+
+Upload:
+
+```powershell
+.\.venv\Scripts\python.exe -m modal volume put --force `
+  legalqa-data .\data\TASK2 /TASK2
+
+.\.venv\Scripts\python.exe -m modal volume put --force `
+  legalqa-data .\data\stopwords.txt /stopwords.txt
+```
+
+Kiểm tra:
+
+```powershell
+.\.venv\Scripts\python.exe -m modal run .\modal_app.py::inspect_inputs
+```
+
+Lúc này `dataset_ready`, `private_ready` và `stopwords_ready` phải là `true`; các cache có thể là `false`.
+
+#### Bước 2: đóng gói corpus bằng CPU
+
+```powershell
+.\.venv\Scripts\python.exe -m modal run .\modal_app.py::pack_corpus
+```
+
+Stage đọc 8.532 JSON và lưu:
+
+```text
+legalqa-data:/cache/corpus_metadata.pkl
+```
+
+#### Bước 3: build BM25 bằng CPU
+
+```powershell
+.\.venv\Scripts\python.exe -m modal run .\modal_app.py::build_bm25
+```
+
+Output:
+
+```text
+legalqa-data:/cache/bm25_index.pkl
+```
+
+#### Bước 4: build parent embeddings bằng H100
+
+```powershell
+.\.venv\Scripts\python.exe -m modal run .\modal_app.py::build_dense_or_child `
+  --kind dense `
+  --batch-size 64
+```
+
+Output:
+
+```text
+legalqa-data:/cache/parent_embeddings.pkl
+```
+
+Nếu hết VRAM, giảm `--batch-size` xuống `32` hoặc `16`.
+
+#### Bước 5: build child embeddings bằng H100
+
+```powershell
+.\.venv\Scripts\python.exe -m modal run .\modal_app.py::build_dense_or_child `
+  --kind child `
+  --batch-size 64
+```
+
+Output:
+
+```text
+legalqa-data:/cache/child_embeddings.pkl
+```
+
+Parent và child embedding được lưu dạng NumPy `float32`; cache tạo bằng T4 vẫn có thể dùng trên H100.
+
+#### Bước 6: kiểm tra ba base cache
+
+```powershell
+.\.venv\Scripts\python.exe -m modal run .\modal_app.py::inspect_inputs
+```
+
+Cần thấy `packed_corpus: true` và cả ba mục `base` đều là `true`.
+
+#### Bước 7: tạo bốn feature cache
+
+```powershell
+.\.venv\Scripts\python.exe -m modal run .\modal_app.py::prepare_features `
+  --run-id prepare-v21 `
+  --ce-batch-size 32
+```
+
+Stage H100 này tạo hoặc tiếp tục:
+
+```text
+legalqa-data:/cache/top_documents.pkl
+legalqa-data:/cache/candidate_audit.pkl
+legalqa-data:/cache/pair_features.pkl
+legalqa-data:/cache/singleton_features.pkl
+legalqa-data:/cache/feature_cache_complete.json
+```
+
+Nếu bị dừng, chạy lại cùng lệnh. Cache lưu theo qid và chỉ xử lý phần chưa hoàn thành.
+
+#### Bước 8: train selector V2.1 bằng CPU
+
+```powershell
+.\.venv\Scripts\python.exe -m modal run .\modal_app.py::train_selector_v21 `
+  --run-id selector-v21-train
+```
+
+Đợi stage hoàn thành rồi kiểm tra:
+
+```powershell
+.\.venv\Scripts\python.exe -m modal run .\modal_app.py::inspect_inputs
+```
+
+Kết quả phải có `selector_ready: true`.
+
+#### Bước 9: smoke test private
+
+```powershell
+.\.venv\Scripts\python.exe -m modal run .\modal_app.py `
+  --dataset private `
+  --private-limit 10 `
+  --ce-batch-size 32 `
+  --checkpoint-every 5
+```
+
+#### Bước 10: chạy full private và lấy file nộp
 
 ```powershell
 .\.venv\Scripts\python.exe -m modal run .\modal_app.py `
   --dataset private `
   --private-limit 0 `
-  --resume-run-id private-<run_id>
+  --ce-batch-size 32 `
+  --checkpoint-every 25
 ```
 
-Hoặc tải output trực tiếp từ Volume:
+File nộp:
+
+```text
+outputs/modal/private-<id>/submission_private.zip
+```
+
+### Resume và tải kết quả thủ công
+
+Nếu private inference bị ngắt, giữ nguyên `private-<id>` đã được in ở lần chạy trước:
+
+```powershell
+.\.venv\Scripts\python.exe -m modal run .\modal_app.py `
+  --dataset private `
+  --private-limit 0 `
+  --resume-run-id private-<id> `
+  --ce-batch-size 32 `
+  --checkpoint-every 25
+```
+
+Checkpoint có chữ ký bundle. Nếu bundle model thay đổi, checkpoint cũ không được tái sử dụng.
+
+Nếu Modal đã chạy xong nhưng terminal không tải output về:
 
 ```powershell
 .\.venv\Scripts\python.exe -m modal volume get --force `
-  legalqa-results "/private-<run_id>" ".\outputs\modal\private-<run_id>"
+  legalqa-results "/private-<id>" ".\outputs\modal\private-<id>"
 ```
 
+Có thể backup cache training và model bundle:
+
+```powershell
+.\.venv\Scripts\python.exe -m modal volume get --force `
+  legalqa-data /cache .\data\cache
+
+.\.venv\Scripts\python.exe -m modal volume get --force `
+  legalqa-models /legalqa/legalqa_selector_v21 .\data\models\legalqa_selector_v21
+```
+
+Không xóa ba Modal Volume nếu muốn tái sử dụng cache, OOF, model và checkpoint cho lần sau.
 ## Phân bổ tài nguyên
 
 | Giai đoạn | Tài nguyên | Lý do |
